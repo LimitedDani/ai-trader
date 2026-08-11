@@ -11,7 +11,8 @@
  *  - Never in the tick loop's hot path: verdicts are cached per coin.
  */
 const OLLAMA_URL = process.env.OLLAMA_URL;
-const MODEL = process.env.OLLAMA_MODEL ?? 'llama3.1:8b';
+const MODEL = process.env.OLLAMA_MODEL ?? 'llama3.2:3b';
+const TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20_000);
 const FEEDS = [
   'https://www.coindesk.com/arc/outboundfeeds/rss/',
   'https://cointelegraph.com/rss',
@@ -42,8 +43,39 @@ async function refreshNews(log: (msg: string) => void): Promise<void> {
   if (collected.length > 0) headlines = collected.slice(0, 40);
 }
 
+/** Pull the model if the Ollama server doesn't have it yet, then warm it up. */
+async function ensureModel(log: (msg: string) => void): Promise<void> {
+  try {
+    const tags = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(10_000) });
+    const models = ((await tags.json()) as { models?: { name: string }[] }).models ?? [];
+    if (!models.some((m) => m.name === MODEL || m.name.startsWith(`${MODEL}:`))) {
+      log(`LLM veto: pulling model ${MODEL} — first start can take several minutes`);
+      const pull = await fetch(`${OLLAMA_URL}/api/pull`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ name: MODEL, stream: false }),
+        signal: AbortSignal.timeout(20 * 60 * 1000),
+      });
+      if (!pull.ok) throw new Error(`pull failed: ${pull.status}`);
+      log(`LLM veto: model ${MODEL} pulled`);
+    }
+    // Warm up and keep the model resident so verdicts don't pay load time.
+    const t0 = Date.now();
+    await fetch(`${OLLAMA_URL}/api/generate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model: MODEL, prompt: 'Reply OK.', stream: false, keep_alive: '24h' }),
+      signal: AbortSignal.timeout(120_000),
+    });
+    log(`LLM veto: model warm (${((Date.now() - t0) / 1000).toFixed(1)}s) — ready`);
+  } catch (err) {
+    log(`LLM veto: setup problem (${(err as Error).message}) — veto stays fail-open until it recovers`);
+  }
+}
+
 export function startNewsRefresh(log: (msg: string) => void): void {
   if (!llmVetoEnabled) return;
+  void ensureModel(log);
   void refreshNews(log);
   setInterval(() => void refreshNews(log), NEWS_REFRESH_MS);
   log(`LLM news veto ENABLED (${OLLAMA_URL}, model ${MODEL}) — veto-only, fail-open`);
@@ -56,6 +88,7 @@ export async function newsVeto(coin: string, log: (msg: string) => void): Promis
   const cached = verdicts.get(coin);
   if (cached && Date.now() - cached.at < VERDICT_TTL_MS) return cached.veto;
 
+  const t0 = Date.now();
   try {
     const prompt =
       `Recent crypto news headlines:\n${headlines.map((h) => `- ${h}`).join('\n')}\n\n` +
@@ -65,16 +98,18 @@ export async function newsVeto(coin: string, log: (msg: string) => void): Promis
     const res = await fetch(`${OLLAMA_URL}/api/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, prompt, stream: false }),
-      signal: AbortSignal.timeout(15_000),
+      body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
+      signal: AbortSignal.timeout(TIMEOUT_MS),
     });
     if (!res.ok) throw new Error(`ollama ${res.status}`);
     const answer = ((await res.json()) as { response?: string }).response ?? '';
     const veto = /^\s*YES/i.test(answer);
     verdicts.set(coin, { veto, at: Date.now(), note: answer.slice(0, 120) });
-    if (veto) log(`LLM veto: blocking ${coin} buys — ${answer.slice(0, 120)}`);
+    const ms = Date.now() - t0;
+    log(`LLM veto: ${coin} → ${veto ? 'BLOCK' : 'clear'} in ${(ms / 1000).toFixed(1)}s${veto ? ` — ${answer.slice(0, 120)}` : ''}`);
     return veto;
-  } catch {
+  } catch (err) {
+    log(`LLM veto: ${coin} check failed after ${((Date.now() - t0) / 1000).toFixed(1)}s (${(err as Error).message}) — fail-open, not blocking`);
     return false; // fail-open by design
   }
 }
