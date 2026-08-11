@@ -12,6 +12,7 @@
     "backtest": "node --env-file=.env dist/backtest.js",
     "sweep": "node --env-file=.env dist/sweep.js",
     "crypto:backtest": "node dist/cryptoBacktest.js",
+    "tune": "node dist/tune.js",
     "crypto:start": "node --experimental-websocket --env-file=.env dist/cryptoBot.js",
     "dev": "tsc && node --env-file=.env dist/index.js"
   },

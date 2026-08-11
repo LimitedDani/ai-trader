@@ -25,6 +25,10 @@ export class LiveBroker {
   constructor(
     private readonly client: BitvavoClient,
     private readonly quote = 'EUR',
+    /** 'maker': post-only limit entries at the bid (cheaper fee tier, may miss
+     *  fills); 'taker': immediate market entries. Exits are always market. */
+    private readonly entryStyle: 'maker' | 'taker' = 'maker',
+    private readonly makerWaitMs = 45_000,
   ) {
     this.state = existsSync(STATE_FILE)
       ? (JSON.parse(readFileSync(STATE_FILE, 'utf8')) as State)
@@ -66,11 +70,14 @@ export class LiveBroker {
     return this.state.positions[symbol];
   }
 
-  async buy(symbol: string, quoteAmount: number, _price: number, barIndex: number, reason = 'signal'): Promise<PaperPosition> {
+  async buy(symbol: string, quoteAmount: number, price: number, barIndex: number, reason = 'signal'): Promise<PaperPosition> {
     if (this.state.positions[symbol]) throw new Error(`${symbol}: position already open`);
     if (quoteAmount > this.cachedBalance) throw new Error(`${symbol}: insufficient ${this.quote} (${this.cachedBalance.toFixed(2)})`);
 
-    const fill = await this.client.marketBuy(symbol, quoteAmount);
+    const fill =
+      this.entryStyle === 'maker' && price > 0
+        ? await this.client.limitBuy(symbol, quoteAmount, price, this.makerWaitMs)
+        : await this.client.marketBuy(symbol, quoteAmount);
     const pos: PaperPosition = {
       symbol,
       qtyBase: fill.qtyBase,

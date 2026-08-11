@@ -91,6 +91,7 @@ export function streamPrices(
   symbols: string[],
   onPrice: (symbol: string, price: number) => void,
   onStatus: (msg: string) => void = () => {},
+  _onQuote?: (symbol: string, bid: number, ask: number) => void, // parity with bitvavo.streamTrades; tickers channel has no book quotes here
 ): void {
   const WS_URL = 'wss://stream.bybit.com/v5/public/spot';
 

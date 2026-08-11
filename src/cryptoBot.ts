@@ -17,6 +17,7 @@ import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
 import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
+import { llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
 import { LiveBroker } from './liveBroker.js';
 import { PaperBroker } from './paperBroker.js';
 import {
@@ -46,6 +47,13 @@ let symbols: string[] = [];
 const positionQuote = Number(process.env.FAST_POSITION_USDT ?? (isLive ? 10 : 200));
 const maxOpen = Number(process.env.FAST_MAX_OPEN ?? 2);
 const maxDailyLoss = Number(process.env.FAST_MAX_DAILY_LOSS ?? (isLive ? 5 : 100));
+
+// Execution & risk gates
+const maxSpreadPct = Number(process.env.FAST_MAX_SPREAD_PCT ?? 0.15); // skip entries when book is wider
+const entryGapMin = Number(process.env.FAST_ENTRY_GAP_MIN ?? 10); // min minutes between automatic entries
+const breadthFrac = Number(process.env.FAST_BREADTH_FRAC ?? 0.3); // >=30% triggered at once = market event
+const regimePct = Number(process.env.FAST_REGIME_PCT ?? 0.5); // BTC this far below its 24h mean = bearish
+const entryStyle = (process.env.FAST_ENTRY_STYLE ?? 'maker') === 'taker' ? 'taker' : 'maker';
 const intervalMin = 5;
 const heartbeatSeconds = 60;
 
@@ -83,7 +91,7 @@ function makeBroker(): PaperBroker | LiveBroker {
   if (!apiKey || !apiSecret) {
     throw new Error('TRADE_MODE=live needs BITVAVO_API_KEY / BITVAVO_API_SECRET in .env (trade-only key, no withdrawal permission)');
   }
-  return new LiveBroker(new BitvavoClient(apiKey, apiSecret, quote), quote);
+  return new LiveBroker(new BitvavoClient(apiKey, apiSecret, quote), quote, entryStyle);
 }
 const broker = makeBroker();
 
@@ -94,6 +102,10 @@ const data = isLive
         const klines = await bitvavo.fetchCandles(symbol, intervalMin, params.lookback + 10);
         return klines.slice(0, -1).map((k) => k.c);
       },
+      recentCloses288: async (symbol: string) => {
+        const klines = await bitvavo.fetchCandles(symbol, intervalMin, 290);
+        return klines.map((k) => k.c);
+      },
       topSymbols: (n: number) => bitvavo.fetchTopMarkets(n, quote),
       stream: bitvavo.streamTrades,
     }
@@ -102,15 +114,58 @@ const data = isLive
         const klines = await bybit.fetchKlines(symbol, intervalMin, 1);
         return klines.slice(0, -1).map((k) => k.c);
       },
+      recentCloses288: async (symbol: string) => {
+        const klines = await bybit.fetchKlines(symbol, intervalMin, 1);
+        return klines.map((k) => k.c);
+      },
       topSymbols: (n: number) => bybit.fetchTopSymbols(n),
       stream: bybit.streamPrices,
     };
 
 const statsBySymbol = new Map<string, Stats>();
 const lastPrice = new Map<string, number>();
+const quotes = new Map<string, { bid: number; ask: number }>();
 const busy = new Set<string>();
 const errorCooldownUntil = new Map<string, number>(); // per-symbol backoff after order errors
 const ERROR_COOLDOWN_MS = 5 * 60 * 1000;
+let lastEntryAt = 0; // global spacing between automatic entries (correlation guard)
+let regimeBearish = false; // BTC below its 24h mean → mean reversion stands down
+
+function spreadPct(symbol: string): number | null {
+  const q = quotes.get(symbol);
+  if (!q) return null;
+  return ((q.ask - q.bid) / ((q.ask + q.bid) / 2)) * 100;
+}
+
+function triggeredCount(): number {
+  return symbols.filter((s) => {
+    const z = currentZ(s);
+    return z !== null && z < -params.zEntry;
+  }).length;
+}
+
+function breadthBlocked(): boolean {
+  return triggeredCount() >= Math.max(3, Math.ceil(symbols.length * breadthFrac));
+}
+
+async function refreshRegime(): Promise<void> {
+  try {
+    const btc = isLive ? `BTC-${quote}` : 'BTCUSDT';
+    const closes = await data.recentCloses288(btc);
+    if (closes.length < 100) return;
+    const mean = closes.reduce((s, c) => s + c, 0) / closes.length;
+    const last = closes[closes.length - 1]!;
+    const wasBearish = regimeBearish;
+    regimeBearish = last < mean * (1 - regimePct / 100);
+    if (regimeBearish !== wasBearish) {
+      log(regimeBearish
+        ? `REGIME: BTC ${(((last - mean) / mean) * 100).toFixed(2)}% below its 24h mean — new entries blocked`
+        : 'REGIME: BTC recovered above its 24h mean — entries re-enabled');
+    }
+  } catch (err) {
+    log(`WARN: regime check failed: ${(err as Error).message}`);
+  }
+}
 let firstTickLogged = false;
 let ticksSinceHeartbeat = 0;
 let totalTicks = 0;
@@ -196,13 +251,25 @@ function onTick(symbol: string, price: number): void {
       if (broker.balanceUsdt < positionQuote) return;
       if (realizedToday() <= -maxDailyLoss) return; // kill switch: no new entries today
 
-      if (shouldEnterAtPrice(price, stats, params)) {
-        const pos = await broker.buy(symbol, positionQuote, price, barIndexNow());
-        log(
-          `BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} (${positionQuote} ${currency}), ` +
-            `stop ${(pos.entry * (1 - params.stopLossPct / 100)).toFixed(4)} | ${broker.summary()}`,
-        );
-      }
+      if (!shouldEnterAtPrice(price, stats, params)) return;
+
+      // Gate chain — each protects against a different way of losing:
+      if (regimeBearish) return; // 3. falling market: reversion stands down
+      if (Date.now() - lastEntryAt < entryGapMin * 60 * 1000) return; // 2. entry spacing
+      if (breadthBlocked()) return; // 2. half the board triggering = one market event, not N signals
+      const spread = spreadPct(symbol);
+      if (spread !== null && spread > maxSpreadPct) return; // 1. wide book = invisible fee
+      const coin = symbol.replace(/[-]?(EUR|USDC|USDT)$/, '');
+      if (await newsVeto(coin, log)) return; // 5. LLM: breaking bad news on this coin
+
+      // Maker entries rest at the best bid; taker/paper entries use the live price.
+      const entryPrice = quotes.get(symbol)?.bid ?? price;
+      lastEntryAt = Date.now();
+      const pos = await broker.buy(symbol, positionQuote, entryPrice, barIndexNow());
+      log(
+        `BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} (${positionQuote} ${currency}), ` +
+          `stop ${(pos.entry * (1 - params.stopLossPct / 100)).toFixed(4)} | ${broker.summary()}`,
+      );
     } catch (err) {
       errorCooldownUntil.set(symbol, Date.now() + ERROR_COOLDOWN_MS);
       log(`ERROR ${symbol}: ${(err as Error).message} — cooling down ${symbol} for ${ERROR_COOLDOWN_MS / 60000}min`);
@@ -256,6 +323,15 @@ function buildDashboardState(): DashboardState {
     mode: isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
     currency,
     buyingEnabled,
+    gates: {
+      regimeBearish,
+      breadthBlocked: breadthBlocked(),
+      triggeredCount: triggeredCount(),
+      entryGapActive: Date.now() - lastEntryAt < entryGapMin * 60 * 1000,
+      llmVeto: llmVetoEnabled,
+      entryStyle: isLive ? entryStyle : 'market (paper)',
+      maxSpreadPct,
+    },
     params: {
       zEntry: params.zEntry,
       stopLossPct: params.stopLossPct,
@@ -375,10 +451,21 @@ async function main(): Promise<void> {
     log,
   );
 
+  log(
+    `Gates: entry style ${isLive ? entryStyle : 'paper/market'}, max spread ${maxSpreadPct}%, ` +
+      `entry gap ${entryGapMin}min, breadth ${Math.round(breadthFrac * 100)}%, ` +
+      `regime BTC -${regimePct}%, LLM veto ${llmVetoEnabled ? 'ON' : 'off'}`,
+  );
+  startNewsRefresh(log);
+
   await refreshStats();
-  data.stream(symbols, onTick, log);
+  await refreshRegime();
+  data.stream(symbols, onTick, log, (symbol: string, bid: number, ask: number) =>
+    quotes.set(symbol, { bid, ask }),
+  );
 
   setInterval(() => void refreshStats(), intervalMin * 60 * 1000);
+  setInterval(() => void refreshRegime(), intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
   setTimeout(heartbeat, 5_000);
 }

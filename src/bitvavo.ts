@@ -47,6 +47,7 @@ export function streamTrades(
   markets: string[],
   onPrice: (market: string, price: number) => void,
   onStatus: (msg: string) => void = () => {},
+  onQuote: (market: string, bid: number, ask: number) => void = () => {},
 ): void {
   function connect(): void {
     const ws = new WebSocket(WS_URL);
@@ -81,11 +82,13 @@ export function streamTrades(
         if (msg.event === 'ticker') {
           const bid = Number(msg.bestBid);
           const ask = Number(msg.bestAsk);
-          const price =
-            Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0
-              ? (bid + ask) / 2
-              : Number(msg.lastPrice);
-          if (Number.isFinite(price) && price > 0) onPrice(msg.market, price);
+          if (Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0) {
+            onQuote(msg.market, bid, ask);
+            onPrice(msg.market, (bid + ask) / 2);
+          } else {
+            const price = Number(msg.lastPrice);
+            if (Number.isFinite(price) && price > 0) onPrice(msg.market, price);
+          }
         }
       } catch {
         // ignore malformed frames
@@ -118,7 +121,7 @@ export class BitvavoClient {
     private readonly quote = 'EUR',
   ) {}
 
-  private async signed<T>(method: 'GET' | 'POST', path: string, body?: Record<string, unknown>): Promise<T> {
+  private async signed<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: Record<string, unknown>): Promise<T> {
     const timestamp = String(Date.now());
     const bodyStr = body ? JSON.stringify(body) : '';
     const signature = createHmac('sha256', this.apiSecret)
@@ -150,6 +153,51 @@ export class BitvavoClient {
   // Bitvavo (MiCA) requires an integer identifying which trader/bot placed
   // each order. Any consistent number works for a single-bot account.
   private readonly operatorId = Number(process.env.BITVAVO_OPERATOR_ID ?? 1001);
+
+  /**
+   * Post-only limit buy at `limitPrice`, spending ~`quoteAmount`. Rests in
+   * the book (maker fee tier) up to `waitMs`; then cancels. Returns the fill
+   * (possibly partial) or throws 'unfilled' if nothing executed.
+   */
+  async limitBuy(
+    market: string,
+    quoteAmount: number,
+    limitPrice: number,
+    waitMs: number,
+  ): Promise<{ qtyBase: number; costQuote: number; price: number; feeQuote: number }> {
+    const price = Number(limitPrice.toPrecision(5)); // Bitvavo: 5 significant digits
+    const amount = String(Math.floor((quoteAmount / price) * 1e8) / 1e8);
+    const placed = await this.signed<OrderResponse & { orderId: string }>('POST', '/order', {
+      market,
+      side: 'buy',
+      orderType: 'limit',
+      amount,
+      price: String(price),
+      postOnly: true,
+      operatorId: this.operatorId,
+    });
+
+    const deadline = Date.now() + waitMs;
+    let order = placed;
+    while (order.status !== 'filled' && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 2000));
+      order = await this.signed<OrderResponse>('GET', `/order?market=${market}&orderId=${placed.orderId}`);
+    }
+    if (order.status !== 'filled') {
+      try {
+        await this.signed('DELETE', `/order?market=${market}&orderId=${placed.orderId}&operatorId=${this.operatorId}`);
+      } catch {
+        // already filled or already gone — final state read below decides
+      }
+      order = await this.signed<OrderResponse>('GET', `/order?market=${market}&orderId=${placed.orderId}`);
+    }
+
+    const qtyBase = Number(order.filledAmount);
+    const spent = Number(order.filledAmountQuote);
+    if (!(qtyBase > 0)) throw new Error(`${market}: limit buy unfilled after ${Math.round(waitMs / 1000)}s`);
+    const feeQuote = order.feeCurrency === this.quote ? Number(order.feePaid) : 0;
+    return { qtyBase, costQuote: spent + feeQuote, price: spent / qtyBase, feeQuote };
+  }
 
   /** Market buy spending `quoteAmount` EUR. Returns actual base qty and EUR cost. */
   async marketBuy(market: string, quoteAmount: number): Promise<{ qtyBase: number; costQuote: number; price: number; feeQuote: number }> {

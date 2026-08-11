@@ -28,6 +28,15 @@ export interface DashboardState {
   mode: string;
   currency: string;
   buyingEnabled: boolean;
+  gates: {
+    regimeBearish: boolean;
+    breadthBlocked: boolean;
+    triggeredCount: number;
+    entryGapActive: boolean;
+    llmVeto: boolean;
+    entryStyle: string;
+    maxSpreadPct: number;
+  };
   params: Record<string, number | string>;
   symbols: {
     symbol: string;
@@ -232,6 +241,7 @@ const PAGE = /* html */ `<!doctype html>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="params">…</span>
   <button class="trade" id="buyToggle" style="display:none"></button>
+  <span id="gates"></span>
   <span class="pulse" id="pulse">connecting…</span>
 </header>
 
@@ -325,6 +335,15 @@ async function refresh() {
   tgl.textContent = s.buyingEnabled ? '⏸ Pause buying' : '▶ Resume buying';
   tgl.style.color = s.buyingEnabled ? '' : 'var(--bad)';
   tgl.style.borderColor = s.buyingEnabled ? '' : 'var(--bad)';
+
+  const g = s.gates || {};
+  const badges = [];
+  if (g.regimeBearish) badges.push('<span class="badge" style="color:var(--bad);border-color:var(--bad)">⛔ regime: BTC bearish</span>');
+  if (g.breadthBlocked) badges.push('<span class="badge" style="color:var(--bad);border-color:var(--bad)">⛔ market-wide dip (' + g.triggeredCount + ' triggered)</span>');
+  if (g.entryGapActive) badges.push('<span class="badge">⏲ entry spacing</span>');
+  badges.push('<span class="badge">entries: ' + g.entryStyle + '</span>');
+  if (g.llmVeto) badges.push('<span class="badge">🧠 LLM veto on</span>');
+  document.getElementById('gates').innerHTML = badges.join(' ');
   document.getElementById('params').textContent =
     'z<-' + s.params.zEntry + ' · SL ' + s.params.stopLossPct + '% · fee ' + s.params.feePctPerSide + '%/side';
 
