@@ -65,3 +65,47 @@ export async function fetchKlines(symbol: string, intervalMin: number, days: num
     .sort((a, b) => a.t - b.t);
 }
 
+/**
+ * Stream real-time last-trade prices over Bybit's public websocket.
+ * Requires Node's WebSocket global (run with --experimental-websocket on Node 20).
+ * Reconnects automatically; sends the protocol ping every 20s.
+ */
+export function streamPrices(symbols: string[], onPrice: (symbol: string, price: number) => void): void {
+  const WS_URL = 'wss://stream.bybit.com/v5/public/spot';
+
+  function connect(): void {
+    const ws = new WebSocket(WS_URL);
+    let ping: ReturnType<typeof setInterval> | undefined;
+
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ op: 'subscribe', args: symbols.map((s) => `tickers.${s}`) }));
+      ping = setInterval(() => ws.send(JSON.stringify({ op: 'ping' })), 20_000);
+    });
+
+    ws.addEventListener('message', (event) => {
+      try {
+        const msg = JSON.parse(String(event.data)) as {
+          topic?: string;
+          data?: { symbol?: string; lastPrice?: string };
+        };
+        const symbol = msg.data?.symbol;
+        const price = Number(msg.data?.lastPrice);
+        if (msg.topic?.startsWith('tickers.') && symbol && Number.isFinite(price) && price > 0) {
+          onPrice(symbol, price);
+        }
+      } catch {
+        // ignore malformed frames
+      }
+    });
+
+    const reconnect = () => {
+      if (ping) clearInterval(ping);
+      setTimeout(connect, 2_000);
+    };
+    ws.addEventListener('close', reconnect);
+    ws.addEventListener('error', () => ws.close());
+  }
+
+  connect();
+}
+

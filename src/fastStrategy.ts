@@ -48,11 +48,30 @@ export function rollingStats(closes: number[], lookback: number): Stats | null {
 export function shouldEnter(closes: number[], p: FastParams): boolean {
   const stats = rollingStats(closes, p.lookback);
   if (!stats) return false;
-  const price = closes[closes.length - 1]!;
+  return shouldEnterAtPrice(closes[closes.length - 1]!, stats, p);
+}
+
+/** Tick-level entry check: live price against stats computed from closed bars. */
+export function shouldEnterAtPrice(price: number, stats: Stats, p: FastParams): boolean {
   // Volatility filter: expected reversion (~1 std) must clear fees with margin.
   const roundTripFee = (p.feePctPerSide * 2) / 100;
   if (stats.std / price < p.minVolMultiple * roundTripFee) return false;
-  return stats.z < -p.zEntry;
+  const z = (price - stats.mean) / stats.std;
+  return z < -p.zEntry;
+}
+
+/** Tick-level exit check: live price against stats from closed bars. */
+export function shouldExitAtPrice(
+  price: number,
+  stats: Stats | null,
+  entryPrice: number,
+  barsHeld: number,
+  p: FastParams,
+): 'revert' | 'stop' | 'timeout' | null {
+  if (price <= entryPrice * (1 - p.stopLossPct / 100)) return 'stop';
+  if (barsHeld >= p.maxHoldBars) return 'timeout';
+  if (stats && (price - stats.mean) / stats.std >= p.zExit) return 'revert';
+  return null;
 }
 
 export function shouldExit(closes: number[], entryPrice: number, barsHeld: number, p: FastParams): 'revert' | 'stop' | 'timeout' | null {
