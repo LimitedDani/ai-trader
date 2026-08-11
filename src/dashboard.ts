@@ -2,7 +2,27 @@
  * Live dashboard served by the crypto bot itself over node:http.
  * One HTML page (inline CSS/JS, no dependencies) polling /api/state.
  */
-import { createServer } from 'node:http';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+
+/** Constant-time credential check for HTTP Basic Auth. */
+function checkBasicAuth(req: IncomingMessage, user: string, password: string): boolean {
+  const header = req.headers.authorization;
+  if (!header?.startsWith('Basic ')) return false;
+  const given = createHash('sha256').update(header.slice(6)).digest();
+  const expected = createHash('sha256')
+    .update(Buffer.from(`${user}:${password}`).toString('base64'))
+    .digest();
+  return timingSafeEqual(given, expected);
+}
+
+function demandAuth(res: ServerResponse): void {
+  res.writeHead(401, {
+    'WWW-Authenticate': 'Basic realm="ai-trader", charset="UTF-8"',
+    'Content-Type': 'text/plain',
+  });
+  res.end('Authentication required');
+}
 
 export interface DashboardState {
   mode: string;
@@ -54,7 +74,18 @@ export function startDashboard(
   onSetBuying: (enabled: boolean) => void,
   log: (msg: string) => void,
 ): void {
+  // Security model: without DASH_PASSWORD the server binds to localhost only.
+  // Setting DASH_PASSWORD enables HTTP Basic Auth AND opens the bind to
+  // 0.0.0.0 (needed for Railway/any cloud host, which fronts it with HTTPS).
+  const password = process.env.DASH_PASSWORD;
+  const user = process.env.DASH_USER ?? 'admin';
+  const host = password ? '0.0.0.0' : '127.0.0.1';
+
   const server = createServer((req, res) => {
+    if (password && !checkBasicAuth(req, user, password)) {
+      demandAuth(res);
+      return;
+    }
     if (req.url === '/api/state') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(getState()));
@@ -107,7 +138,13 @@ export function startDashboard(
     res.writeHead(404);
     res.end('not found');
   });
-  server.listen(port, '127.0.0.1', () => log(`Dashboard: http://localhost:${port}`));
+  server.listen(port, host, () =>
+    log(
+      password
+        ? `Dashboard: listening on ${host}:${port} (Basic Auth as "${user}")`
+        : `Dashboard: http://localhost:${port} (local only — set DASH_PASSWORD to expose it)`,
+    ),
+  );
 }
 
 const PAGE = /* html */ `<!doctype html>

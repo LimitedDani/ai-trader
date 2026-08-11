@@ -4,8 +4,10 @@
  * so the bot can be restarted without losing track.
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 
-const STATE_FILE = process.env.PAPER_STATE_FILE ?? 'paper-state.json';
+const STATE_FILE =
+  process.env.PAPER_STATE_FILE ?? join(process.env.STATE_DIR ?? '.', 'paper-state.json');
 const START_USDT = 10_000;
 
 export interface PaperPosition {

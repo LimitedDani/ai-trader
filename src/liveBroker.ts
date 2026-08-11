@@ -5,10 +5,12 @@
  * live-state.json since the exchange doesn't know about our positions.
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
+import { join } from 'node:path';
 import { BitvavoClient } from './bitvavo.js';
 import type { PaperFill, PaperPosition } from './paperBroker.js';
 
-const STATE_FILE = process.env.LIVE_STATE_FILE ?? 'live-state.json';
+const STATE_FILE =
+  process.env.LIVE_STATE_FILE ?? join(process.env.STATE_DIR ?? '.', 'live-state.json');
 
 interface State {
   startQuote: number | null; // first observed EUR balance, baseline for the equity chart

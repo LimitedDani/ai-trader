@@ -44,3 +44,29 @@ pnpm start      # run the bot against your paper account
 
 Never commit `.env`. If a key ever leaks (pasted in chat, committed, logged),
 rotate it immediately in the Alpaca dashboard.
+
+## Crypto bot on Railway
+
+The crypto bot (`dist/cryptoBot.js`) is deployable to Railway as-is
+([railway.json](railway.json) holds the build/start commands).
+
+1. Push this repo to GitHub and create a Railway project from it.
+2. Add a **volume** mounted at `/data` (state files must survive redeploys).
+3. Set environment variables in the Railway service:
+
+   | Variable | Value |
+   | --- | --- |
+   | `STATE_DIR` | `/data` |
+   | `DASH_PASSWORD` | a long random password — **required**; without it the dashboard only binds to localhost and won't be reachable |
+   | `DASH_USER` | optional login name (default `admin`) |
+   | `TRADE_MODE` | `paper` or `live` |
+   | `BITVAVO_API_KEY` / `BITVAVO_API_SECRET` | only for live mode (trade-only key, no withdrawal permission) |
+   | `FAST_*` | strategy overrides as desired |
+
+4. Open the generated `https://<service>.up.railway.app` — the browser shows a
+   login popup (HTTP Basic Auth over Railway's TLS).
+
+Security notes: the dashboard has real-money buy/sell buttons in live mode —
+treat `DASH_PASSWORD` like a bank password. Basic Auth is only acceptable
+because Railway terminates HTTPS. Live keys on a cloud host is a trust
+decision; the no-withdrawal permission on the Bitvavo key is the backstop.
