@@ -36,7 +36,13 @@ export async function fetchTopMarkets(n: number): Promise<string[]> {
     .map((t) => t.market);
 }
 
-/** Stream real-time trade prices over Bitvavo's public websocket. */
+/**
+ * Stream real-time prices over Bitvavo's public websocket.
+ * Subscribes to BOTH channels: `trades` (a message per executed trade —
+ * sparse on a small venue) and `ticker` (a message per best-bid/ask change —
+ * much denser). Trades give the traded price; between trades, the bid/ask
+ * midpoint keeps the price current so stops react to quote moves too.
+ */
 export function streamTrades(
   markets: string[],
   onPrice: (market: string, price: number) => void,
@@ -45,15 +51,41 @@ export function streamTrades(
   function connect(): void {
     const ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ action: 'subscribe', channels: [{ name: 'trades', markets }] }));
-      onStatus(`Bitvavo websocket connected, subscribed to ${markets.length} markets`);
+      ws.send(
+        JSON.stringify({
+          action: 'subscribe',
+          channels: [
+            { name: 'trades', markets },
+            { name: 'ticker', markets },
+          ],
+        }),
+      );
+      onStatus(`Bitvavo websocket connected, subscribed to ${markets.length} markets (trades + ticker)`);
     });
     ws.addEventListener('message', (event) => {
       try {
-        const msg = JSON.parse(String(event.data)) as { event?: string; market?: string; price?: string };
-        const price = Number(msg.price);
-        if (msg.event === 'trade' && msg.market && Number.isFinite(price) && price > 0) {
-          onPrice(msg.market, price);
+        const msg = JSON.parse(String(event.data)) as {
+          event?: string;
+          market?: string;
+          price?: string;
+          lastPrice?: string;
+          bestBid?: string;
+          bestAsk?: string;
+        };
+        if (!msg.market) return;
+        if (msg.event === 'trade') {
+          const price = Number(msg.price);
+          if (Number.isFinite(price) && price > 0) onPrice(msg.market, price);
+          return;
+        }
+        if (msg.event === 'ticker') {
+          const bid = Number(msg.bestBid);
+          const ask = Number(msg.bestAsk);
+          const price =
+            Number.isFinite(bid) && bid > 0 && Number.isFinite(ask) && ask > 0
+              ? (bid + ask) / 2
+              : Number(msg.lastPrice);
+          if (Number.isFinite(price) && price > 0) onPrice(msg.market, price);
         }
       } catch {
         // ignore malformed frames
