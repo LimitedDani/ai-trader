@@ -5,7 +5,7 @@
     "buildCommand": "pnpm build"
   },
   "deploy": {
-    "startCommand": "node --experimental-websocket dist/cryptoBot.js",
+    "startCommand": "node --experimental-websocket dist/launch.js",
     "restartPolicyType": "ON_FAILURE",
     "restartPolicyMaxRetries": 10
   }
