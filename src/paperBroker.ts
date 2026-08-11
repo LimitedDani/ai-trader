@@ -5,7 +5,7 @@
  */
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 
-const STATE_FILE = 'paper-state.json';
+const STATE_FILE = process.env.PAPER_STATE_FILE ?? 'paper-state.json';
 const START_USDT = 10_000;
 
 export interface PaperPosition {
@@ -55,6 +55,14 @@ export class PaperBroker {
 
   get openPositions(): PaperPosition[] {
     return Object.values(this.state.positions);
+  }
+
+  get allFills(): PaperFill[] {
+    return this.state.fills;
+  }
+
+  get startUsdt(): number {
+    return START_USDT;
   }
 
   position(symbol: string): PaperPosition | undefined {

@@ -13,6 +13,7 @@
  * Usage: pnpm build && pnpm crypto:start
  */
 import { fetchKlines, streamPrices } from './bybit.js';
+import { startDashboard, type DashboardState } from './dashboard.js';
 import { PaperBroker } from './paperBroker.js';
 import {
   DEFAULT_FAST_PARAMS,
@@ -66,6 +67,7 @@ async function refreshStats(): Promise<void> {
 
 let firstTickLogged = false;
 let ticksSinceHeartbeat = 0;
+let totalTicks = 0;
 
 function onTick(symbol: string, price: number): void {
   if (!firstTickLogged) {
@@ -73,6 +75,7 @@ function onTick(symbol: string, price: number): void {
     log(`first tick received (${symbol} @ ${price}) — stream is live`);
   }
   ticksSinceHeartbeat++;
+  totalTicks++;
   lastPrice.set(symbol, price);
   if (busy.has(symbol)) return;
   const stats = statsBySymbol.get(symbol);
@@ -123,6 +126,71 @@ function heartbeat(): void {
   ticksSinceHeartbeat = 0;
 }
 
+function buildDashboardState(): DashboardState {
+  const sells = broker.allFills.filter(
+    (f): f is typeof f & { pnlUsdt: number } => f.side === 'Sell' && f.pnlUsdt !== undefined,
+  );
+  const realizedPnl = sells.reduce((s, f) => s + f.pnlUsdt, 0);
+  const marketValue = broker.openPositions.reduce(
+    (s, p) => s + p.qtyBase * (lastPrice.get(p.symbol) ?? p.entry),
+    0,
+  );
+
+  // Equity curve: realized equity after each closed trade, plus a live point.
+  let running = broker.startUsdt;
+  const equitySeries: { t: string; v: number }[] = [
+    ...(sells.length > 0 ? [{ t: sells[0]!.time, v: broker.startUsdt }] : []),
+    ...sells.map((f) => {
+      running += f.pnlUsdt;
+      return { t: f.time, v: running };
+    }),
+  ];
+  equitySeries.push({ t: new Date().toISOString(), v: broker.balanceUsdt + marketValue });
+
+  return {
+    mode: 'paper trading (live prices)',
+    params: {
+      zEntry: params.zEntry,
+      stopLossPct: params.stopLossPct,
+      maxHoldBars: params.maxHoldBars,
+      feePctPerSide: params.feePctPerSide,
+    },
+    symbols: symbols.map((symbol) => {
+      const price = lastPrice.get(symbol) ?? null;
+      const stats = statsBySymbol.get(symbol);
+      return {
+        symbol,
+        price,
+        z: price !== null && stats ? (price - stats.mean) / stats.std : null,
+        holding: broker.position(symbol) !== undefined,
+      };
+    }),
+    wallet: {
+      usdt: broker.balanceUsdt,
+      equityNow: broker.balanceUsdt + marketValue,
+      realizedPnl,
+      openCount: broker.openPositions.length,
+      closedCount: sells.length,
+      wins: sells.filter((f) => f.pnlUsdt > 0).length,
+    },
+    positions: broker.openPositions.map((p) => {
+      const current = lastPrice.get(p.symbol) ?? null;
+      return {
+        symbol: p.symbol,
+        entry: p.entry,
+        current,
+        qtyBase: p.qtyBase,
+        unrealizedPnl:
+          current === null ? null : p.qtyBase * current * (1 - params.feePctPerSide / 100) - p.costUsdt,
+        holdMinutes: (barIndexNow() - p.enteredAtBar) * intervalMin,
+      };
+    }),
+    fills: broker.allFills.slice(-200),
+    equitySeries,
+    totalTicks,
+  };
+}
+
 async function main(): Promise<void> {
   if (typeof WebSocket === 'undefined') {
     throw new Error('WebSocket global missing — run via `pnpm crypto:start` (needs --experimental-websocket on Node 20)');
@@ -133,6 +201,8 @@ async function main(): Promise<void> {
   log(`Symbols: ${symbols.join(', ')} | ${positionUsdt} USDT/trade, max ${maxOpen} open`);
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
   log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry} — a few signals/day is normal.`);
+
+  startDashboard(Number(process.env.DASH_PORT ?? 8787), buildDashboardState, log);
 
   await refreshStats();
   streamPrices(symbols, onTick, log);
