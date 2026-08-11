@@ -7,6 +7,7 @@ import { createServer } from 'node:http';
 export interface DashboardState {
   mode: string;
   currency: string;
+  buyingEnabled: boolean;
   params: Record<string, number | string>;
   symbols: {
     symbol: string;
@@ -48,6 +49,7 @@ export function startDashboard(
   port: number,
   getState: () => DashboardState,
   onTrade: (t: TradeAction) => TradeResult | Promise<TradeResult>,
+  onSetBuying: (enabled: boolean) => void,
   log: (msg: string) => void,
 ): void {
   const server = createServer((req, res) => {
@@ -75,6 +77,23 @@ export function startDashboard(
           res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify(result));
         })();
+      });
+      return;
+    }
+    if (req.url === '/api/buying' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => (body += chunk));
+      req.on('end', () => {
+        try {
+          const { enabled } = JSON.parse(body) as { enabled: boolean };
+          if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean');
+          onSetBuying(enabled);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, message: enabled ? 'Buying enabled' : 'Buying paused — open positions still exit normally' }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, message: (err as Error).message }));
+        }
       });
       return;
     }
@@ -173,6 +192,7 @@ const PAGE = /* html */ `<!doctype html>
   <h1>ai-trader</h1>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="params">…</span>
+  <button class="trade" id="buyToggle" style="display:none"></button>
   <span class="pulse" id="pulse">connecting…</span>
 </header>
 
@@ -259,6 +279,13 @@ async function refresh() {
   modeEl.style.color = s.mode.startsWith('LIVE') ? 'var(--bad)' : '';
   modeEl.style.borderColor = s.mode.startsWith('LIVE') ? 'var(--bad)' : '';
   document.getElementById('eqTitle').textContent = 'Equity (mark-to-market, ' + cur + ')';
+
+  const tgl = document.getElementById('buyToggle');
+  tgl.style.display = '';
+  tgl.dataset.enabled = s.buyingEnabled ? '1' : '';
+  tgl.textContent = s.buyingEnabled ? '⏸ Pause buying' : '▶ Resume buying';
+  tgl.style.color = s.buyingEnabled ? '' : 'var(--bad)';
+  tgl.style.borderColor = s.buyingEnabled ? '' : 'var(--bad)';
   document.getElementById('params').textContent =
     'z<-' + s.params.zEntry + ' · SL ' + s.params.stopLossPct + '% · fee ' + s.params.feePctPerSide + '%/side';
 
@@ -383,6 +410,21 @@ wrap.addEventListener('mouseleave', () => {
   document.getElementById('tooltip').style.display = 'none';
   const dot = document.getElementById('hoverdot');
   if (dot) dot.style.display = 'none';
+});
+
+document.getElementById('buyToggle').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const enable = !btn.dataset.enabled;
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/buying', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: enable }),
+    });
+    toast((await res.json()).message);
+  } catch { toast('request failed — is the bot running?'); }
+  btn.disabled = false;
+  refresh();
 });
 
 refresh();

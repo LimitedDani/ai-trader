@@ -11,6 +11,7 @@
  * Same strategy, dashboard and manual buttons in both modes.
  * Usage: pnpm build && pnpm crypto:start
  */
+import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
@@ -52,6 +53,19 @@ const params: FastParams = {
 };
 
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
+
+// Buying toggle: pauses the bot's automatic entries; exits (stop/revert/
+// timeout) and manual dashboard actions keep working. Persisted per mode.
+const CONTROL_FILE = `control-${mode}.json`;
+let buyingEnabled = existsSync(CONTROL_FILE)
+  ? (JSON.parse(readFileSync(CONTROL_FILE, 'utf8')) as { buyingEnabled: boolean }).buyingEnabled
+  : true;
+
+function setBuying(enabled: boolean): void {
+  buyingEnabled = enabled;
+  writeFileSync(CONTROL_FILE, JSON.stringify({ buyingEnabled }));
+  log(`Buying ${enabled ? 'ENABLED' : 'PAUSED'} — exits and manual trades stay active`);
+}
 
 function makeBroker(): PaperBroker | LiveBroker {
   if (!isLive) return new PaperBroker(params.feePctPerSide);
@@ -155,6 +169,7 @@ function onTick(symbol: string, price: number): void {
         return;
       }
 
+      if (!buyingEnabled) return; // user paused new entries; exits above still ran
       if (broker.openPositions.length >= maxOpen) return;
       if (broker.balanceUsdt < positionQuote) return;
       if (realizedToday() <= -maxDailyLoss) return; // kill switch: no new entries today
@@ -217,6 +232,7 @@ function buildDashboardState(): DashboardState {
   return {
     mode: isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
     currency,
+    buyingEnabled,
     params: {
       zEntry: params.zEntry,
       stopLossPct: params.stopLossPct,
@@ -324,7 +340,8 @@ async function main(): Promise<void> {
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
   log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry}.`);
 
-  startDashboard(Number(process.env.DASH_PORT ?? 8787), buildDashboardState, handleManualTrade, log);
+  if (!buyingEnabled) log('Note: buying is PAUSED (persisted from last session) — toggle it on the dashboard');
+  startDashboard(Number(process.env.DASH_PORT ?? 8787), buildDashboardState, handleManualTrade, setBuying, log);
 
   await refreshStats();
   data.stream(symbols, onTick, log);
