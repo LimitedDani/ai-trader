@@ -40,11 +40,39 @@ export interface DashboardState {
   totalTicks: number;
 }
 
-export function startDashboard(port: number, getState: () => DashboardState, log: (msg: string) => void): void {
+export type TradeAction = { action: 'buy' | 'sell'; symbol: string };
+export type TradeResult = { ok: boolean; message: string };
+
+export function startDashboard(
+  port: number,
+  getState: () => DashboardState,
+  onTrade: (t: TradeAction) => TradeResult,
+  log: (msg: string) => void,
+): void {
   const server = createServer((req, res) => {
     if (req.url === '/api/state') {
       res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
       res.end(JSON.stringify(getState()));
+      return;
+    }
+    if (req.url === '/api/trade' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => (body += chunk));
+      req.on('end', () => {
+        let result: TradeResult;
+        try {
+          const t = JSON.parse(body) as TradeAction;
+          if ((t.action !== 'buy' && t.action !== 'sell') || typeof t.symbol !== 'string') {
+            result = { ok: false, message: 'invalid request' };
+          } else {
+            result = onTrade({ action: t.action, symbol: t.symbol.toUpperCase() });
+          }
+        } catch (err) {
+          result = { ok: false, message: (err as Error).message };
+        }
+        res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(result));
+      });
       return;
     }
     if (req.url === '/' || req.url === '/index.html') {
@@ -122,6 +150,18 @@ const PAGE = /* html */ `<!doctype html>
     white-space: nowrap;
   }
   .empty { color: var(--muted); padding: 12px 0; }
+  button.trade {
+    font: 12px system-ui, sans-serif; padding: 3px 12px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--surface); color: var(--ink);
+    cursor: pointer;
+  }
+  button.trade:hover { border-color: var(--series-1); color: var(--series-1); }
+  button.trade:disabled { opacity: 0.5; cursor: wait; }
+  #toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); display: none;
+    background: var(--surface); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 16px; font-size: 13px; box-shadow: 0 2px 12px rgba(0,0,0,0.18);
+  }
   footer { color: var(--muted); font-size: 12px; margin-top: 8px; }
 </style>
 </head>
@@ -163,9 +203,31 @@ const PAGE = /* html */ `<!doctype html>
 </section>
 
 <footer>Local paper trading — live Bybit prices, simulated fills. Updates every 2s.</footer>
+<div id="toast"></div>
 
 <script>
 const fmt = (n, d = 2) => n == null ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+
+let toastTimer;
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.style.display = 'block';
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => { el.style.display = 'none'; }, 4000);
+}
+
+async function trade(action, symbol, btn) {
+  if (!confirm(action.toUpperCase() + ' ' + symbol + ' (paper)?')) return;
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/trade', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, symbol }),
+    });
+    toast((await res.json()).message);
+  } catch { toast('request failed — is the bot running?'); }
+  refresh();
+}
 // Adaptive decimals so sub-dollar coins show real movement (0.3196, not 0.32).
 const px = (n) => n == null ? '—' : fmt(n, n >= 100 ? 2 : n >= 1 ? 4 : 6);
 const pnlCell = (v, suffix = '') => {
@@ -224,7 +286,9 @@ async function refresh() {
       : '<span style="color:var(--muted)">' + fmt(row.volPct) + '% — too calm</span>';
     return '<tr' + (row.volOk === false ? ' style="opacity:0.55"' : '') + '><td>' + row.symbol + '</td><td class="num">' + px(row.price) +
       '</td><td class="num">' + (row.z == null ? '—' : fmt(row.z)) + '</td><td>' + bar + '</td><td class="num">' + volCell + '</td><td>' +
-      (row.holding ? '<span class="hold">holding</span>' : '') + '</td></tr>';
+      (row.holding
+        ? '<span class="hold">holding</span>'
+        : '<button class="trade" onclick="trade(\\'buy\\', \\'' + row.symbol + '\\', this)">Buy</button>') + '</td></tr>';
   }).join('');
   const minVol = s.symbols.find(r => r.minVolPct != null);
   document.getElementById('signalsNote').textContent = minVol
@@ -233,13 +297,14 @@ async function refresh() {
 
   document.getElementById('positions').innerHTML = s.positions.length === 0
     ? '<div class="empty">None — waiting for a signal.</div>'
-    : '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Now</th><th class="num">Unrealized P&L</th><th class="num">z now</th><th class="num">Stop</th><th class="num">Held</th></tr></thead><tbody>' +
+    : '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Now</th><th class="num">Unrealized P&L</th><th class="num">z now</th><th class="num">Stop</th><th class="num">Held</th><th></th></tr></thead><tbody>' +
       s.positions.map(p =>
         '<tr><td>' + p.symbol + '</td><td class="num">' + fmt(p.qtyBase, 6) + '</td><td class="num">' + px(p.entry) +
         '</td><td class="num">' + px(p.current) + '</td><td class="num">' + pnlCell(p.unrealizedPnl, ' USDT') +
         '</td><td class="num">' + (p.z == null ? '—' : fmt(p.z)) +
         '</td><td class="num">' + px(p.stopPrice) +
-        '</td><td class="num">' + p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm</td></tr>').join('') + '</tbody></table>' +
+        '</td><td class="num">' + p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm</td>' +
+        '<td><button class="trade" onclick="trade(\\'sell\\', \\'' + p.symbol + '\\', this)">Sell</button></td></tr>').join('') + '</tbody></table>' +
       '<div class="empty" style="padding-top:8px">Sells when: z rises to ≥ 0 (price back at its mean — the profit exit) · price hits the stop · or the hold timer runs out.</div>';
 
   const sells = s.fills.filter(f => f.side === 'Sell').slice(-50).reverse();

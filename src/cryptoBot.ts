@@ -13,7 +13,7 @@
  * Usage: pnpm build && pnpm crypto:start
  */
 import { fetchKlines, fetchTopSymbols, streamPrices } from './bybit.js';
-import { startDashboard, type DashboardState } from './dashboard.js';
+import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
 import { PaperBroker } from './paperBroker.js';
 import {
   DEFAULT_FAST_PARAMS,
@@ -219,6 +219,31 @@ function buildDashboardState(): DashboardState {
   };
 }
 
+function handleManualTrade({ action, symbol }: TradeAction): TradeResult {
+  if (!symbols.includes(symbol)) return { ok: false, message: `${symbol} is not tracked by this bot` };
+  const price = lastPrice.get(symbol);
+  if (price === undefined) return { ok: false, message: `${symbol}: no live price yet` };
+
+  try {
+    if (action === 'buy') {
+      if (broker.position(symbol)) return { ok: false, message: `${symbol}: already holding` };
+      if (broker.balanceUsdt < positionUsdt) {
+        return { ok: false, message: `insufficient paper USDT (${broker.balanceUsdt.toFixed(2)})` };
+      }
+      const pos = broker.buy(symbol, positionUsdt, price, barIndexNow(), 'manual');
+      log(`MANUAL BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${price} | ${broker.summary()}`);
+      return { ok: true, message: `Bought ${symbol} @ ${price} — bot manages the exit (stop/revert/timeout)` };
+    }
+    const open = broker.position(symbol);
+    if (!open) return { ok: false, message: `${symbol}: no open position` };
+    const fill = broker.sell(symbol, price, 'manual');
+    log(`MANUAL SELL ${symbol} @ ${price} | P&L ${fill.pnlUsdt!.toFixed(2)} USDT | ${broker.summary()}`);
+    return { ok: true, message: `Sold ${symbol} @ ${price} — P&L ${fill.pnlUsdt!.toFixed(2)} USDT` };
+  } catch (err) {
+    return { ok: false, message: (err as Error).message };
+  }
+}
+
 async function main(): Promise<void> {
   if (typeof WebSocket === 'undefined') {
     throw new Error('WebSocket global missing — run via `pnpm crypto:start` (needs --experimental-websocket on Node 20)');
@@ -239,7 +264,7 @@ async function main(): Promise<void> {
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
   log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry} — a few signals/day is normal.`);
 
-  startDashboard(Number(process.env.DASH_PORT ?? 8787), buildDashboardState, log);
+  startDashboard(Number(process.env.DASH_PORT ?? 8787), buildDashboardState, handleManualTrade, log);
 
   await refreshStats();
   streamPrices(symbols, onTick, log);

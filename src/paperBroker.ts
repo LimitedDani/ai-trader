@@ -69,7 +69,7 @@ export class PaperBroker {
     return this.state.positions[symbol];
   }
 
-  buy(symbol: string, usdtAmount: number, price: number, barIndex: number): PaperPosition {
+  buy(symbol: string, usdtAmount: number, price: number, barIndex: number, reason = 'signal'): PaperPosition {
     if (this.state.positions[symbol]) throw new Error(`${symbol}: position already open`);
     if (usdtAmount > this.state.usdt) throw new Error(`${symbol}: insufficient paper USDT`);
     const feeUsdt = usdtAmount * (this.feePctPerSide / 100);
@@ -77,7 +77,7 @@ export class PaperBroker {
     const pos: PaperPosition = { symbol, qtyBase, entry: price, enteredAtBar: barIndex, costUsdt: usdtAmount };
     this.state.usdt -= usdtAmount;
     this.state.positions[symbol] = pos;
-    this.state.fills.push({ time: new Date().toISOString(), symbol, side: 'Buy', price, qtyBase, feeUsdt });
+    this.state.fills.push({ time: new Date().toISOString(), symbol, side: 'Buy', price, qtyBase, feeUsdt, reason });
     this.save();
     return pos;
   }
