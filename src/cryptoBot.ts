@@ -45,11 +45,15 @@ if (llmTrader && isLive) {
 // Live quote currency: EUR (Bitvavo category A, 0.25% taker) or USDC
 // (category B, 0.05% taker — 5x cheaper; convert EUR->USDC on Bitvavo first).
 const quote = (process.env.FAST_QUOTE ?? 'EUR').toUpperCase();
-const currency = isLive ? quote : 'USDT';
+// LLM trader trades a paper wallet against Bitvavo data: same venue, coins
+// and fees as the live statistical bot, so their results compare directly.
+// (Also practical: Bybit 403s from some cloud egress IPs; Bitvavo doesn't.)
+const useBitvavoData = isLive || llmTrader;
+const currency = useBitvavoData ? quote : 'USDT';
 
 const symbolsEnv = (
   process.env.FAST_SYMBOLS ??
-  (isLive ? `BTC-${quote},ETH-${quote},SOL-${quote}` : 'BTCUSDT,ETHUSDT,SOLUSDT')
+  (useBitvavoData ? `BTC-${quote},ETH-${quote},SOL-${quote}` : 'BTCUSDT,ETHUSDT,SOLUSDT')
 ).trim().toUpperCase();
 let symbols: string[] = [];
 
@@ -72,7 +76,7 @@ const params: FastParams = {
   stopLossPct: Number(process.env.FAST_STOP_LOSS_PCT ?? 2.5),
   maxHoldBars: Number(process.env.FAST_MAX_HOLD_BARS ?? 72),
   // Bitvavo taker fees at the entry tier: EUR markets 0.25%, USDC markets 0.05%.
-  feePctPerSide: Number(process.env.FAST_FEE_PCT ?? (isLive ? (quote === 'USDC' ? 0.05 : 0.25) : 0.1)),
+  feePctPerSide: Number(process.env.FAST_FEE_PCT ?? (useBitvavoData ? (quote === 'USDC' ? 0.05 : 0.25) : 0.1)),
   // After the hold timer: 'breakeven' holds until the first net-profitable
   // price (only the stop-loss forces a losing exit); 'sell' dumps at market.
   timeoutAction: (process.env.FAST_TIMEOUT_ACTION ?? 'breakeven') === 'sell' ? 'sell' : 'breakeven',
@@ -106,7 +110,7 @@ function makeBroker(): PaperBroker | LiveBroker {
 const broker = makeBroker();
 
 // Mode-specific data plumbing; everything below it is shared.
-const data = isLive
+const data = useBitvavoData
   ? {
       recentCloses: async (symbol: string) => {
         const klines = await bitvavo.fetchCandles(symbol, intervalMin, params.lookback + 10);
@@ -160,7 +164,7 @@ function breadthBlocked(): boolean {
 
 async function refreshRegime(): Promise<void> {
   try {
-    const btc = isLive ? `BTC-${quote}` : 'BTCUSDT';
+    const btc = useBitvavoData ? `BTC-${quote}` : 'BTCUSDT';
     const closes = await data.recentCloses288(btc);
     if (closes.length < 100) return;
     const mean = closes.reduce((s, c) => s + c, 0) / closes.length;
@@ -515,7 +519,7 @@ async function main(): Promise<void> {
   if (topMatch) {
     const n = Math.min(Number(topMatch[1]), 50);
     symbols = await data.topSymbols(n);
-    log(`Auto-selected top ${symbols.length} ${currency} pairs by 24h volume`);
+    log(`Auto-selected top ${symbols.length} ${useBitvavoData ? quote : 'USDT'} pairs by 24h volume`);
   } else {
     symbols = symbolsEnv.split(',').map((s) => s.trim()).filter(Boolean);
   }
