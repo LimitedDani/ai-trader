@@ -13,6 +13,18 @@
 const OLLAMA_URL = process.env.OLLAMA_URL;
 const MODEL = process.env.OLLAMA_MODEL ?? 'llama3.2:3b';
 const TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20_000);
+// "user:password" for tunnels that require Basic Auth (e.g. ngrok --basic-auth).
+// REQUIRED when tunneling: Ollama itself has no auth — never expose it bare.
+const OLLAMA_AUTH = process.env.OLLAMA_AUTH;
+
+function ollamaFetch(path: string, init: RequestInit = {}): Promise<Response> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'application/json',
+    ...(init.headers as Record<string, string> | undefined),
+  };
+  if (OLLAMA_AUTH) headers.Authorization = `Basic ${Buffer.from(OLLAMA_AUTH).toString('base64')}`;
+  return fetch(`${OLLAMA_URL}${path}`, { ...init, headers });
+}
 const FEEDS = [
   'https://www.coindesk.com/arc/outboundfeeds/rss/',
   'https://cointelegraph.com/rss',
@@ -46,13 +58,12 @@ async function refreshNews(log: (msg: string) => void): Promise<void> {
 /** Pull the model if the Ollama server doesn't have it yet, then warm it up. */
 async function ensureModel(log: (msg: string) => void): Promise<void> {
   try {
-    const tags = await fetch(`${OLLAMA_URL}/api/tags`, { signal: AbortSignal.timeout(10_000) });
+    const tags = await ollamaFetch('/api/tags', { signal: AbortSignal.timeout(10_000) });
     const models = ((await tags.json()) as { models?: { name: string }[] }).models ?? [];
     if (!models.some((m) => m.name === MODEL || m.name.startsWith(`${MODEL}:`))) {
       log(`LLM veto: pulling model ${MODEL} — first start can take several minutes`);
-      const pull = await fetch(`${OLLAMA_URL}/api/pull`, {
+      const pull = await ollamaFetch('/api/pull', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: MODEL, stream: false }),
         signal: AbortSignal.timeout(20 * 60 * 1000),
       });
@@ -61,9 +72,8 @@ async function ensureModel(log: (msg: string) => void): Promise<void> {
     }
     // Warm up and keep the model resident so verdicts don't pay load time.
     const t0 = Date.now();
-    await fetch(`${OLLAMA_URL}/api/generate`, {
+    await ollamaFetch('/api/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: MODEL, prompt: 'Reply OK.', stream: false, keep_alive: '24h' }),
       signal: AbortSignal.timeout(120_000),
     });
@@ -95,9 +105,8 @@ export async function newsVeto(coin: string, log: (msg: string) => void): Promis
       `Question: do any of these headlines report BREAKING NEGATIVE news specifically about ` +
       `${coin} (hack, exploit, lawsuit, delisting, insolvency, depeg)? ` +
       `General market moves do not count. Answer with exactly YES or NO, then one short sentence.`;
-    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+    const res = await ollamaFetch('/api/generate', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
       signal: AbortSignal.timeout(TIMEOUT_MS),
     });
