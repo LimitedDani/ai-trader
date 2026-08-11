@@ -24,11 +24,11 @@ export async function fetchCandles(market: string, intervalMin: number, limit: n
     .sort((a, b) => a.t - b.t);
 }
 
-/** Top-N EUR markets by 24h quote volume. */
-export async function fetchTopMarkets(n: number): Promise<string[]> {
+/** Top-N markets by 24h quote volume for the given quote currency (EUR or USDC). */
+export async function fetchTopMarkets(n: number, quote = 'EUR'): Promise<string[]> {
   const tickers = await publicGet<{ market: string; volumeQuote?: string; volume?: string; last?: string }[]>('/ticker/24h');
   return tickers
-    .filter((t) => t.market.endsWith('-EUR'))
+    .filter((t) => t.market.endsWith(`-${quote}`) && !t.market.startsWith('USDC-') && !t.market.startsWith('EUR'))
     .map((t) => ({ market: t.market, vol: Number(t.volumeQuote ?? 0) || Number(t.volume ?? 0) * Number(t.last ?? 0) }))
     .filter((t) => Number.isFinite(t.vol) && t.vol > 0)
     .sort((a, b) => b.vol - a.vol)
@@ -114,6 +114,8 @@ export class BitvavoClient {
   constructor(
     private readonly apiKey: string,
     private readonly apiSecret: string,
+    /** Quote currency of the traded markets — fees paid in it are booked. */
+    private readonly quote = 'EUR',
   ) {}
 
   private async signed<T>(method: 'GET' | 'POST', path: string, body?: Record<string, unknown>): Promise<T> {
@@ -162,7 +164,7 @@ export class BitvavoClient {
     if (order.status !== 'filled') throw new Error(`${market} buy not filled (status ${order.status})`);
     const qtyBase = Number(order.filledAmount);
     const spent = Number(order.filledAmountQuote);
-    const feeQuote = order.feeCurrency === 'EUR' ? Number(order.feePaid) : 0;
+    const feeQuote = order.feeCurrency === this.quote ? Number(order.feePaid) : 0;
     if (!(qtyBase > 0) || !(spent > 0)) throw new Error(`${market} buy: unexpected fill (${order.filledAmount}/${order.filledAmountQuote})`);
     return { qtyBase, costQuote: spent + feeQuote, price: spent / qtyBase, feeQuote };
   }
@@ -182,7 +184,7 @@ export class BitvavoClient {
     if (order.status !== 'filled') throw new Error(`${market} sell not filled (status ${order.status})`);
     const gross = Number(order.filledAmountQuote);
     const qtySold = Number(order.filledAmount);
-    const feeQuote = order.feeCurrency === 'EUR' ? Number(order.feePaid) : 0;
+    const feeQuote = order.feeCurrency === this.quote ? Number(order.feePaid) : 0;
     return { proceedsQuote: gross - feeQuote, price: gross / qtySold, qtySold, feeQuote };
   }
 }

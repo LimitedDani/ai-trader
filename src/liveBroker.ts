@@ -22,7 +22,10 @@ export class LiveBroker {
   private state: State;
   private cachedBalance = 0;
 
-  constructor(private readonly client: BitvavoClient) {
+  constructor(
+    private readonly client: BitvavoClient,
+    private readonly quote = 'EUR',
+  ) {
     this.state = existsSync(STATE_FILE)
       ? (JSON.parse(readFileSync(STATE_FILE, 'utf8')) as State)
       : { startQuote: null, positions: {}, fills: [] };
@@ -34,7 +37,7 @@ export class LiveBroker {
 
   /** Call at startup and periodically; keeps the sync getters accurate. */
   async refreshBalance(): Promise<void> {
-    this.cachedBalance = await this.client.balance('EUR');
+    this.cachedBalance = await this.client.balance(this.quote);
     if (this.state.startQuote === null) {
       // Baseline includes EUR already committed to tracked positions.
       const committed = Object.values(this.state.positions).reduce((s, p) => s + p.costUsdt, 0);
@@ -65,7 +68,7 @@ export class LiveBroker {
 
   async buy(symbol: string, quoteAmount: number, _price: number, barIndex: number, reason = 'signal'): Promise<PaperPosition> {
     if (this.state.positions[symbol]) throw new Error(`${symbol}: position already open`);
-    if (quoteAmount > this.cachedBalance) throw new Error(`${symbol}: insufficient EUR (${this.cachedBalance.toFixed(2)})`);
+    if (quoteAmount > this.cachedBalance) throw new Error(`${symbol}: insufficient ${this.quote} (${this.cachedBalance.toFixed(2)})`);
 
     const fill = await this.client.marketBuy(symbol, quoteAmount);
     const pos: PaperPosition = {
@@ -117,8 +120,8 @@ export class LiveBroker {
     const sells = this.state.fills.filter((f) => f.side === 'Sell');
     const realized = sells.reduce((s, f) => s + (f.pnlUsdt ?? 0), 0);
     return (
-      `EUR ${this.cachedBalance.toFixed(2)} | open positions ${this.openPositions.length} | ` +
-      `closed trades ${sells.length} | realized P&L ${realized.toFixed(2)} EUR`
+      `${this.quote} ${this.cachedBalance.toFixed(2)} | open positions ${this.openPositions.length} | ` +
+      `closed trades ${sells.length} | realized P&L ${realized.toFixed(2)} ${this.quote}`
     );
   }
 }

@@ -32,10 +32,14 @@ import {
 const mode = (process.env.TRADE_MODE ?? 'paper').toLowerCase();
 if (mode !== 'paper' && mode !== 'live') throw new Error(`TRADE_MODE must be "paper" or "live", got "${mode}"`);
 const isLive = mode === 'live';
-const currency = isLive ? 'EUR' : 'USDT';
+// Live quote currency: EUR (Bitvavo category A, 0.25% taker) or USDC
+// (category B, 0.05% taker — 5x cheaper; convert EUR->USDC on Bitvavo first).
+const quote = (process.env.FAST_QUOTE ?? 'EUR').toUpperCase();
+const currency = isLive ? quote : 'USDT';
 
 const symbolsEnv = (
-  process.env.FAST_SYMBOLS ?? (isLive ? 'BTC-EUR,ETH-EUR,SOL-EUR' : 'BTCUSDT,ETHUSDT,SOLUSDT')
+  process.env.FAST_SYMBOLS ??
+  (isLive ? `BTC-${quote},ETH-${quote},SOL-${quote}` : 'BTCUSDT,ETHUSDT,SOLUSDT')
 ).trim().toUpperCase();
 let symbols: string[] = [];
 
@@ -50,8 +54,8 @@ const params: FastParams = {
   zEntry: Number(process.env.FAST_Z_ENTRY ?? 2.5),
   stopLossPct: Number(process.env.FAST_STOP_LOSS_PCT ?? 2.5),
   maxHoldBars: Number(process.env.FAST_MAX_HOLD_BARS ?? 72),
-  // Bitvavo taker fee is 0.25%/side at the entry tier — 2.5x the paper sim.
-  feePctPerSide: Number(process.env.FAST_FEE_PCT ?? (isLive ? 0.25 : 0.1)),
+  // Bitvavo taker fees at the entry tier: EUR markets 0.25%, USDC markets 0.05%.
+  feePctPerSide: Number(process.env.FAST_FEE_PCT ?? (isLive ? (quote === 'USDC' ? 0.05 : 0.25) : 0.1)),
   // After the hold timer: 'breakeven' holds until the first net-profitable
   // price (only the stop-loss forces a losing exit); 'sell' dumps at market.
   timeoutAction: (process.env.FAST_TIMEOUT_ACTION ?? 'breakeven') === 'sell' ? 'sell' : 'breakeven',
@@ -79,7 +83,7 @@ function makeBroker(): PaperBroker | LiveBroker {
   if (!apiKey || !apiSecret) {
     throw new Error('TRADE_MODE=live needs BITVAVO_API_KEY / BITVAVO_API_SECRET in .env (trade-only key, no withdrawal permission)');
   }
-  return new LiveBroker(new BitvavoClient(apiKey, apiSecret));
+  return new LiveBroker(new BitvavoClient(apiKey, apiSecret, quote), quote);
 }
 const broker = makeBroker();
 
@@ -90,7 +94,7 @@ const data = isLive
         const klines = await bitvavo.fetchCandles(symbol, intervalMin, params.lookback + 10);
         return klines.slice(0, -1).map((k) => k.c);
       },
-      topSymbols: (n: number) => bitvavo.fetchTopMarkets(n),
+      topSymbols: (n: number) => bitvavo.fetchTopMarkets(n, quote),
       stream: bitvavo.streamTrades,
     }
   : {
@@ -340,7 +344,7 @@ async function main(): Promise<void> {
   if (topMatch) {
     const n = Math.min(Number(topMatch[1]), 50);
     symbols = await data.topSymbols(n);
-    log(`Auto-selected top ${symbols.length} ${isLive ? 'EUR' : 'USDT'} pairs by 24h volume`);
+    log(`Auto-selected top ${symbols.length} ${currency} pairs by 24h volume`);
   } else {
     symbols = symbolsEnv.split(',').map((s) => s.trim()).filter(Boolean);
   }
