@@ -1,8 +1,13 @@
 /**
- * Optional LLM news veto. When OLLAMA_URL is set (e.g. http://localhost:11434
- * with Ollama running), recent crypto headlines are cached and, before each
- * automatic entry, a local LLM is asked one narrow question: is there breaking
- * NEGATIVE news about this specific coin?
+ * Optional LLM news veto with two backends:
+ *
+ *  - Claude API (set ANTHROPIC_API_KEY): pay-per-call, no idle cost —
+ *    a verdict costs a fraction of a cent at this trade frequency.
+ *  - Ollama (set OLLAMA_URL): self-hosted, e.g. http://localhost:11434.
+ *
+ * Recent crypto headlines are cached and, before each automatic entry, the
+ * LLM is asked one narrow question: is there breaking NEGATIVE news about
+ * this specific coin?
  *
  * Design rules:
  *  - VETO-ONLY: the LLM can block a buy, never create one.
@@ -10,9 +15,15 @@
  *    silently stop the strategy.
  *  - Never in the tick loop's hot path: verdicts are cached per coin.
  */
+import Anthropic from '@anthropic-ai/sdk';
+
+const ANTHROPIC_KEY = process.env.ANTHROPIC_API_KEY;
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL ?? 'claude-haiku-4-5';
 const OLLAMA_URL = process.env.OLLAMA_URL;
 const MODEL = process.env.OLLAMA_MODEL ?? 'llama3.2:3b';
 const TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20_000);
+
+const claude = ANTHROPIC_KEY ? new Anthropic({ apiKey: ANTHROPIC_KEY, timeout: TIMEOUT_MS, maxRetries: 1 }) : null;
 const FEEDS = [
   'https://www.coindesk.com/arc/outboundfeeds/rss/',
   'https://cointelegraph.com/rss',
@@ -20,7 +31,8 @@ const FEEDS = [
 const VERDICT_TTL_MS = 10 * 60 * 1000;
 const NEWS_REFRESH_MS = 5 * 60 * 1000;
 
-export const llmVetoEnabled = Boolean(OLLAMA_URL);
+export const llmVetoEnabled = Boolean(ANTHROPIC_KEY || OLLAMA_URL);
+export const llmBackend = ANTHROPIC_KEY ? `Claude API (${CLAUDE_MODEL})` : OLLAMA_URL ? `Ollama (${MODEL})` : 'off';
 
 let headlines: string[] = [];
 const verdicts = new Map<string, { veto: boolean; at: number; note: string }>();
@@ -75,10 +87,31 @@ async function ensureModel(log: (msg: string) => void): Promise<void> {
 
 export function startNewsRefresh(log: (msg: string) => void): void {
   if (!llmVetoEnabled) return;
-  void ensureModel(log);
+  if (!claude) void ensureModel(log); // Ollama needs provisioning; Claude API does not
   void refreshNews(log);
   setInterval(() => void refreshNews(log), NEWS_REFRESH_MS);
-  log(`LLM news veto ENABLED (${OLLAMA_URL}, model ${MODEL}) — veto-only, fail-open`);
+  log(`LLM news veto ENABLED via ${llmBackend} — veto-only, fail-open`);
+}
+
+/** Ask the configured backend; returns the raw text answer. */
+async function askLlm(prompt: string): Promise<string> {
+  if (claude) {
+    const response = await claude.messages.create({
+      model: CLAUDE_MODEL,
+      max_tokens: 100,
+      messages: [{ role: 'user', content: prompt }],
+    });
+    const block = response.content[0];
+    return block?.type === 'text' ? block.text : '';
+  }
+  const res = await fetch(`${OLLAMA_URL}/api/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  if (!res.ok) throw new Error(`ollama ${res.status}`);
+  return ((await res.json()) as { response?: string }).response ?? '';
 }
 
 /** Ask the local LLM whether breaking negative news should block buying `coin`. */
@@ -95,15 +128,8 @@ export async function newsVeto(coin: string, log: (msg: string) => void): Promis
       `Question: do any of these headlines report BREAKING NEGATIVE news specifically about ` +
       `${coin} (hack, exploit, lawsuit, delisting, insolvency, depeg)? ` +
       `General market moves do not count. Answer with exactly YES or NO, then one short sentence.`;
-    const res = await fetch(`${OLLAMA_URL}/api/generate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    if (!res.ok) throw new Error(`ollama ${res.status}`);
-    const answer = ((await res.json()) as { response?: string }).response ?? '';
-    const veto = /^\s*YES/i.test(answer);
+    const answer = await askLlm(prompt);
+    const veto = /^\s*YES/i.test(answer.trim());
     verdicts.set(coin, { veto, at: Date.now(), note: answer.slice(0, 120) });
     const ms = Date.now() - t0;
     log(`LLM veto: ${coin} → ${veto ? 'BLOCK' : 'clear'} in ${(ms / 1000).toFixed(1)}s${veto ? ` — ${answer.slice(0, 120)}` : ''}`);

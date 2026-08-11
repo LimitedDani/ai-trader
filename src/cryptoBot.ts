@@ -16,8 +16,9 @@ import { dirname, join } from 'node:path';
 import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
+import { recordRows, type MlRow } from './dataLogger.js';
 import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
-import { llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
+import { llmBackend, llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
 import { LiveBroker } from './liveBroker.js';
 import { PaperBroker } from './paperBroker.js';
 import {
@@ -198,6 +199,29 @@ function realizedToday(): number {
   return broker.allFills
     .filter((f) => f.side === 'Sell' && new Date(f.time) >= midnight)
     .reduce((s, f) => s + (f.pnlUsdt ?? 0), 0);
+}
+
+function recordMlSnapshot(): void {
+  const now = new Date().toISOString();
+  const triggered = triggeredCount();
+  const rows: MlRow[] = [];
+  for (const symbol of symbols) {
+    const price = lastPrice.get(symbol);
+    if (price === undefined) continue;
+    const stats = statsBySymbol.get(symbol);
+    rows.push({
+      t: now,
+      symbol,
+      price,
+      z: currentZ(symbol),
+      volPct: stats ? (stats.std / price) * 100 : null,
+      spreadPct: spreadPct(symbol),
+      regimeBearish,
+      triggeredCount: triggered,
+      holding: broker.position(symbol) !== undefined,
+    });
+  }
+  recordRows(rows, log);
 }
 
 async function refreshStats(): Promise<void> {
@@ -486,7 +510,7 @@ async function main(): Promise<void> {
   log(
     `Gates: entry style ${isLive ? entryStyle : 'paper/market'}, max spread ${maxSpreadPct}%, ` +
       `entry gap ${entryGapMin}min, breadth ${Math.round(breadthFrac * 100)}%, ` +
-      `regime BTC -${regimePct}%, LLM veto ${llmVetoEnabled ? 'ON' : 'off'}`,
+      `regime BTC -${regimePct}%, LLM veto ${llmVetoEnabled ? `ON — ${llmBackend}` : 'off'}`,
   );
   startNewsRefresh(log);
 
@@ -496,8 +520,10 @@ async function main(): Promise<void> {
     quotes.set(symbol, { bid, ask }),
   );
 
-  setInterval(() => void refreshStats(), intervalMin * 60 * 1000);
-  setInterval(() => void refreshRegime(), intervalMin * 60 * 1000);
+  setInterval(() => {
+    void refreshStats().then(() => recordMlSnapshot());
+    void refreshRegime();
+  }, intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
   setTimeout(heartbeat, 5_000);
 }

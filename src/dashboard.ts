@@ -3,7 +3,9 @@
  * One HTML page (inline CSS/JS, no dependencies) polling /api/state.
  */
 import { createHash, timingSafeEqual } from 'node:crypto';
+import { createReadStream, existsSync } from 'node:fs';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import { ML_DATA_FILE } from './dataLogger.js';
 
 /** Constant-time credential check for HTTP Basic Auth. */
 function checkBasicAuth(req: IncomingMessage, user: string, password: string): boolean {
@@ -120,6 +122,20 @@ export function startDashboard(
           res.end(JSON.stringify(result));
         })();
       });
+      return;
+    }
+    if (req.url === '/api/ml-data') {
+      // Download the ML training dataset collected on the volume.
+      if (!existsSync(ML_DATA_FILE)) {
+        res.writeHead(404, { 'Content-Type': 'text/plain' });
+        res.end('no data collected yet');
+        return;
+      }
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson',
+        'Content-Disposition': 'attachment; filename="ml-data.jsonl"',
+      });
+      createReadStream(ML_DATA_FILE).pipe(res);
       return;
     }
     if (req.url === '/api/buying' && req.method === 'POST') {
