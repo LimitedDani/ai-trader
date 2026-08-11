@@ -433,7 +433,38 @@ async function main(): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, 30_000));
     await (broker as LiveBroker).refreshBalance();
     setInterval(() => void (broker as LiveBroker).refreshBalance().catch((e: Error) => log(`WARN balance: ${e.message}`)), 60_000);
-  } else {
+
+    // Adopt coins already sitting in the account (bought manually, or left
+    // behind by another bot instance) so their exits are managed too.
+    try {
+      await (broker as LiveBroker).adoptExisting(
+        5,
+        async (market) => {
+          try {
+            const klines = await bitvavo.fetchCandles(market, intervalMin, 2);
+            return klines[klines.length - 1]?.c ?? null;
+          } catch {
+            return null;
+          }
+        },
+        barIndexNow(),
+        log,
+      );
+    } catch (err) {
+      log(`WARN: asset adoption failed: ${(err as Error).message}`);
+    }
+  }
+
+  // Positions restored from state (or just adopted) may reference markets
+  // outside today's TOP-N list — track them anyway so their exits work.
+  for (const p of broker.openPositions) {
+    if (!symbols.includes(p.symbol)) {
+      symbols.push(p.symbol);
+      log(`Tracking ${p.symbol} (open position outside the selected list)`);
+    }
+  }
+
+  if (!isLive) {
     log('Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
   }
 

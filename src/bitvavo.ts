@@ -150,6 +150,14 @@ export class BitvavoClient {
     return Number(rows[0]?.available ?? 0);
   }
 
+  /** All non-zero balances in the account. */
+  async balances(): Promise<{ symbol: string; available: number }[]> {
+    const rows = await this.signed<{ symbol: string; available: string; inOrder: string }[]>('GET', '/balance');
+    return rows
+      .map((r) => ({ symbol: r.symbol, available: Number(r.available) }))
+      .filter((r) => r.available > 0);
+  }
+
   // Bitvavo (MiCA) requires an integer identifying which trader/bot placed
   // each order. Any consistent number works for a single-bot account.
   private readonly operatorId = Number(process.env.BITVAVO_OPERATOR_ID ?? 1001);

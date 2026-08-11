@@ -124,6 +124,67 @@ export class LiveBroker {
     return fill;
   }
 
+  /**
+   * Scan the account for coin balances that aren't tracked yet and adopt
+   * them as positions. Returns the adopted markets so the bot can start
+   * streaming/tracking them.
+   */
+  async adoptExisting(
+    minQuoteValue: number,
+    priceOf: (market: string) => Promise<number | null>,
+    barIndex: number,
+    log: (msg: string) => void,
+  ): Promise<string[]> {
+    const adopted: string[] = [];
+    for (const b of await this.client.balances()) {
+      if (b.symbol === this.quote || b.symbol === 'EUR' || b.symbol === 'USDC') continue;
+      const market = `${b.symbol}-${this.quote}`;
+      if (this.state.positions[market]) continue;
+      const price = await priceOf(market);
+      if (price === null) {
+        log(`adopt: no ${market} market found — leaving ${b.symbol} untouched`);
+        continue;
+      }
+      const value = b.available * price;
+      if (value < minQuoteValue) continue; // dust
+      this.adopt(market, b.available, price, barIndex);
+      adopted.push(market);
+      log(
+        `ADOPTED ${market}: ${b.available} @ ~${price} (≈${value.toFixed(2)} ${this.quote}) — ` +
+          `exits managed from this price (original cost basis unknown to the API)`,
+      );
+    }
+    return adopted;
+  }
+
+  /**
+   * Adopt a coin balance that already exists in the Bitvavo account but is
+   * not tracked. Entry is the CURRENT price (cost basis is unknown to the
+   * API), so all exits measure from the adoption moment.
+   */
+  adopt(symbol: string, qtyBase: number, price: number, barIndex: number): PaperPosition {
+    if (this.state.positions[symbol]) throw new Error(`${symbol}: already tracked`);
+    const pos: PaperPosition = {
+      symbol,
+      qtyBase,
+      entry: price,
+      enteredAtBar: barIndex,
+      costUsdt: qtyBase * price,
+    };
+    this.state.positions[symbol] = pos;
+    this.state.fills.push({
+      time: new Date().toISOString(),
+      symbol,
+      side: 'Buy',
+      price,
+      qtyBase,
+      feeUsdt: 0,
+      reason: 'adopted',
+    });
+    this.save();
+    return pos;
+  }
+
   summary(): string {
     const sells = this.state.fills.filter((f) => f.side === 'Sell');
     const realized = sells.reduce((s, f) => s + (f.pnlUsdt ?? 0), 0);
