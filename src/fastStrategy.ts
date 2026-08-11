@@ -16,6 +16,13 @@ export interface FastParams {
   maxHoldBars: number;
   feePctPerSide: number;
   minVolMultiple: number; // require std/price > multiple * round-trip fee
+  /**
+   * What happens when maxHoldBars expires:
+   * 'sell'      — sell at market immediately (accepts whatever P&L is there)
+   * 'breakeven' — keep holding, sell at the first price that nets a profit
+   *               after fees; only the stop-loss can force a losing exit.
+   */
+  timeoutAction: 'sell' | 'breakeven';
 }
 
 export const DEFAULT_FAST_PARAMS: FastParams = {
@@ -26,7 +33,13 @@ export const DEFAULT_FAST_PARAMS: FastParams = {
   maxHoldBars: 36, // 3 hours
   feePctPerSide: 0.1, // Bybit spot base tier
   minVolMultiple: 3,
+  timeoutAction: 'sell',
 };
+
+/** Price at which selling nets a profit after both fee legs. */
+export function breakevenPrice(entryPrice: number, p: FastParams): number {
+  return entryPrice * (1 + (2 * p.feePctPerSide) / 100);
+}
 
 export interface Stats {
   mean: number;
@@ -67,20 +80,24 @@ export function shouldExitAtPrice(
   entryPrice: number,
   barsHeld: number,
   p: FastParams,
-): 'revert' | 'stop' | 'timeout' | null {
+): ExitReason | null {
   if (price <= entryPrice * (1 - p.stopLossPct / 100)) return 'stop';
-  if (barsHeld >= p.maxHoldBars) return 'timeout';
+  if (barsHeld >= p.maxHoldBars) {
+    if (p.timeoutAction === 'sell') return 'timeout';
+    // Overtime: hold until the first net-profitable price. The reversion
+    // exit is suspended here — it could realize a loss. Only the stop-loss
+    // above can still force a losing exit.
+    return price >= breakevenPrice(entryPrice, p) ? 'breakeven' : null;
+  }
   if (stats && (price - stats.mean) / stats.std >= p.zExit) return 'revert';
   return null;
 }
 
-export function shouldExit(closes: number[], entryPrice: number, barsHeld: number, p: FastParams): 'revert' | 'stop' | 'timeout' | null {
-  const price = closes[closes.length - 1]!;
-  if (price <= entryPrice * (1 - p.stopLossPct / 100)) return 'stop';
-  if (barsHeld >= p.maxHoldBars) return 'timeout';
+export type ExitReason = 'revert' | 'stop' | 'timeout' | 'breakeven';
+
+export function shouldExit(closes: number[], entryPrice: number, barsHeld: number, p: FastParams): ExitReason | null {
   const stats = rollingStats(closes, p.lookback);
-  if (stats && stats.z >= p.zExit) return 'revert';
-  return null;
+  return shouldExitAtPrice(closes[closes.length - 1]!, stats, entryPrice, barsHeld, p);
 }
 
 export interface FastTrade {
@@ -88,7 +105,7 @@ export interface FastTrade {
   exit: number;
   pnlPct: number;
   barsHeld: number;
-  reason: 'revert' | 'stop' | 'timeout' | 'end';
+  reason: ExitReason | 'end';
 }
 
 export function backtestFast(klines: Kline[], p: FastParams): FastTrade[] {

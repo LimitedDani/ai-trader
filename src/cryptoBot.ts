@@ -19,6 +19,7 @@ import { startDashboard, type DashboardState, type TradeAction, type TradeResult
 import { LiveBroker } from './liveBroker.js';
 import { PaperBroker } from './paperBroker.js';
 import {
+  breakevenPrice,
   DEFAULT_FAST_PARAMS,
   rollingStats,
   shouldEnterAtPrice,
@@ -50,6 +51,9 @@ const params: FastParams = {
   maxHoldBars: Number(process.env.FAST_MAX_HOLD_BARS ?? 72),
   // Bitvavo taker fee is 0.25%/side at the entry tier — 2.5x the paper sim.
   feePctPerSide: Number(process.env.FAST_FEE_PCT ?? (isLive ? 0.25 : 0.1)),
+  // After the hold timer: 'breakeven' holds until the first net-profitable
+  // price (only the stop-loss forces a losing exit); 'sell' dumps at market.
+  timeoutAction: (process.env.FAST_TIMEOUT_ACTION ?? 'breakeven') === 'sell' ? 'sell' : 'breakeven',
 };
 
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
@@ -115,6 +119,16 @@ function currentZ(symbol: string): number | null {
   return (price - stats.mean) / stats.std;
 }
 
+function isOvertime(enteredAtBar: number): boolean {
+  return params.timeoutAction === 'breakeven' && barIndexNow() - enteredAtBar >= params.maxHoldBars;
+}
+
+/** Positions still inside their hold window. Overtime (breakeven-hunting)
+ *  positions no longer occupy a slot, so new signals keep getting taken. */
+function activePositionCount(): number {
+  return broker.openPositions.filter((p) => !isOvertime(p.enteredAtBar)).length;
+}
+
 function realizedToday(): number {
   const midnight = new Date();
   midnight.setHours(0, 0, 0, 0);
@@ -170,7 +184,7 @@ function onTick(symbol: string, price: number): void {
       }
 
       if (!buyingEnabled) return; // user paused new entries; exits above still ran
-      if (broker.openPositions.length >= maxOpen) return;
+      if (activePositionCount() >= maxOpen) return; // overtime positions don't hold a slot
       if (broker.balanceUsdt < positionQuote) return;
       if (realizedToday() <= -maxDailyLoss) return; // kill switch: no new entries today
 
@@ -277,6 +291,8 @@ function buildDashboardState(): DashboardState {
         z: currentZ(p.symbol),
         stopPrice: p.entry * (1 - params.stopLossPct / 100),
         timeoutMinutes: params.maxHoldBars * intervalMin,
+        overtime: isOvertime(p.enteredAtBar),
+        breakevenPrice: breakevenPrice(p.entry, params),
       };
     }),
     fills: broker.allFills.slice(-200),

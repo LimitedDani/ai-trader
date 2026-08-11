@@ -36,6 +36,8 @@ export interface DashboardState {
     z: number | null;
     stopPrice: number;
     timeoutMinutes: number;
+    overtime: boolean;
+    breakevenPrice: number;
   }[];
   fills: unknown[];
   equitySeries: { t: string; v: number }[];
@@ -303,7 +305,8 @@ async function refresh() {
     ['Cash', fmt(w.usdt) + ' <small>' + cur + '</small>'],
     ['Realized P&L', pnlCell(w.realizedPnl, ' ' + cur)],
     ['Closed trades', w.closedCount + ' <small>win ' + winRate + '</small>'],
-    ['Open positions', w.openCount],
+    ['Open positions', w.openCount + (s.positions.filter(p => p.overtime).length
+        ? ' <small>' + s.positions.filter(p => p.overtime).length + ' waiting for profit</small>' : '')],
     ['Ticks evaluated', tickRate],
   ].map(([k, v]) => '<div class="tile"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>').join('');
 
@@ -339,9 +342,11 @@ async function refresh() {
         '</td><td class="num">' + px(p.current) + '</td><td class="num">' + pnlCell(p.unrealizedPnl, ' ' + cur) +
         '</td><td class="num">' + (p.z == null ? '—' : fmt(p.z)) +
         '</td><td class="num">' + px(p.stopPrice) +
-        '</td><td class="num">' + p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm</td>' +
+        '</td><td class="num">' + (p.overtime
+          ? p.holdMinutes + 'm — <span style="color:var(--muted)">waiting for ≥ ' + px(p.breakevenPrice) + '</span>'
+          : p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm') + '</td>' +
         '<td><button class="trade" onclick="trade(\\'sell\\', \\'' + p.symbol + '\\', this)">Sell</button></td></tr>').join('') + '</tbody></table>' +
-      '<div class="empty" style="padding-top:8px">Sells when: z rises to ≥ 0 (price back at its mean — the profit exit) · price hits the stop · or the hold timer runs out.</div>';
+      '<div class="empty" style="padding-top:8px">Sells when: z rises to ≥ 0 (price back at its mean) · price hits the stop · after the hold timer: only at the first net-profitable price (breakeven hunt) — the stop-loss stays the one losing exit.</div>';
 
   const sells = s.fills.filter(f => f.side === 'Sell').slice(-50).reverse();
   document.getElementById('fills').innerHTML = sells.length === 0
