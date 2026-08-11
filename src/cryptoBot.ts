@@ -65,12 +65,14 @@ async function refreshStats(): Promise<void> {
 }
 
 let firstTickLogged = false;
+let ticksSinceHeartbeat = 0;
 
 function onTick(symbol: string, price: number): void {
   if (!firstTickLogged) {
     firstTickLogged = true;
     log(`first tick received (${symbol} @ ${price}) — stream is live`);
   }
+  ticksSinceHeartbeat++;
   lastPrice.set(symbol, price);
   if (busy.has(symbol)) return;
   const stats = statsBySymbol.get(symbol);
@@ -117,7 +119,8 @@ function heartbeat(): void {
     const open = broker.position(symbol);
     return `${symbol} ${price} z=${z.toFixed(2)}${open ? ` [holding, entry ${open.entry}]` : ''}`;
   });
-  log(parts.join(' | '));
+  log(`${parts.join(' | ')} || ${ticksSinceHeartbeat} ticks evaluated in last ${heartbeatSeconds}s`);
+  ticksSinceHeartbeat = 0;
 }
 
 async function main(): Promise<void> {
