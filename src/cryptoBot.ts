@@ -17,7 +17,7 @@ import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
 import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
-import { llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
+import { askOllama, currentHeadlines, llmConfigured, llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
 import { LiveBroker } from './liveBroker.js';
 import { PaperBroker } from './paperBroker.js';
 import {
@@ -33,6 +33,15 @@ import {
 const mode = (process.env.TRADE_MODE ?? 'paper').toLowerCase();
 if (mode !== 'paper' && mode !== 'live') throw new Error(`TRADE_MODE must be "paper" or "live", got "${mode}"`);
 const isLive = mode === 'live';
+
+// LLM_TRADER=1: an LLM makes the buy/sell decisions instead of the z-score
+// strategy. PAPER ONLY by design — an unproven, non-deterministic strategy
+// must earn its way to real money on the same terms every strategy did.
+// The tick-level stop-loss remains active underneath as a disaster brake.
+const llmTrader = process.env.LLM_TRADER === '1';
+if (llmTrader && isLive) {
+  throw new Error('LLM_TRADER runs in paper mode only. Let it beat the statistical bot on paper first, then promote it deliberately.');
+}
 // Live quote currency: EUR (Bitvavo category A, 0.25% taker) or USDC
 // (category B, 0.05% taker — 5x cheaper; convert EUR->USDC on Bitvavo first).
 const quote = (process.env.FAST_QUOTE ?? 'EUR').toUpperCase();
@@ -236,7 +245,12 @@ function onTick(symbol: string, price: number): void {
 
       if (open) {
         const barsHeld = barIndexNow() - open.enteredAtBar;
-        const reason = shouldExitAtPrice(price, stats, open.entry, barsHeld, params);
+        // LLM-trader mode: the LLM owns sells; only the stop-loss fires automatically.
+        const reason = llmTrader
+          ? price <= open.entry * (1 - params.stopLossPct / 100)
+            ? ('stop' as const)
+            : null
+          : shouldExitAtPrice(price, stats, open.entry, barsHeld, params);
         if (reason) {
           const fill = await broker.sell(symbol, price, reason);
           log(
@@ -247,6 +261,7 @@ function onTick(symbol: string, price: number): void {
         return;
       }
 
+      if (llmTrader) return; // entries are the LLM's job (llmTradeCycle), not the tick loop's
       if (!buyingEnabled) return; // user paused new entries; exits above still ran
       if (activePositionCount() >= maxOpen) return; // overtime positions don't hold a slot
       if (broker.balanceUsdt < positionQuote) return;
@@ -321,7 +336,9 @@ function buildDashboardState(): DashboardState {
   equitySeries.push({ t: new Date().toISOString(), v: broker.balanceUsdt + marketValue });
 
   return {
-    mode: isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
+    mode: llmTrader
+      ? `LLM TRADER — paper (experimental)${lastLlmComment ? ` · "${lastLlmComment}"` : ''}`
+      : isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
     currency,
     buyingEnabled,
     gates: {
@@ -412,6 +429,83 @@ async function handleManualTrade({ action, symbol }: TradeAction): Promise<Trade
   }
 }
 
+let lastLlmComment = '';
+
+/** LLM-trader mode: give the model the full picture, let it decide, execute. */
+async function llmTradeCycle(): Promise<void> {
+  if (!llmConfigured) return; // no brain connected yet — do nothing, loudly at startup only
+  if (!buyingEnabled) return;
+
+  const marketLines = symbols
+    .map((s) => ({ s, z: currentZ(s), p: lastPrice.get(s), stats: statsBySymbol.get(s) }))
+    .filter((r) => r.p !== undefined && r.z !== null)
+    .sort((a, b) => Math.abs(b.z!) - Math.abs(a.z!))
+    .slice(0, 15)
+    .map((r) => `${r.s}: price ${r.p}, z=${r.z!.toFixed(2)}, vol ${r.stats ? ((r.stats.std / r.p!) * 100).toFixed(2) : '?'}%, spread ${spreadPct(r.s)?.toFixed(3) ?? '?'}%`);
+
+  const posLines = broker.openPositions.map((p) => {
+    const now = lastPrice.get(p.symbol) ?? p.entry;
+    const pnlPct = ((now - p.entry) / p.entry) * 100 - params.feePctPerSide * 2;
+    return `${p.symbol}: qty ${p.qtyBase.toFixed(6)}, entry ${p.entry}, now ${now}, net P&L ${pnlPct.toFixed(2)}%, held ${(barIndexNow() - p.enteredAtBar) * intervalMin}min`;
+  });
+
+  const prompt =
+    `You are an autonomous crypto trader managing a PAPER portfolio (quote currency ${currency}).\n` +
+    `Cash: ${broker.balanceUsdt.toFixed(2)} ${currency}. Max ${maxOpen} open positions, ${positionQuote} ${currency} per buy. ` +
+    `Round-trip trading fee ${(params.feePctPerSide * 2).toFixed(2)}% — a trade must beat that to profit.\n\n` +
+    `Open positions:\n${posLines.length ? posLines.join('\n') : '(none)'}\n\n` +
+    `Market snapshot (z = std devs from 4h mean; negative = dip):\n${marketLines.join('\n')}\n\n` +
+    `Recent headlines:\n${currentHeadlines().slice(0, 15).map((h) => `- ${h}`).join('\n') || '(none)'}\n\n` +
+    `Decide your actions for the next 5 minutes. You may buy, sell, or do nothing. ` +
+    `Respond with ONLY a JSON object, no other text:\n` +
+    `{"actions":[{"type":"buy","symbol":"XXX-${quote}","reason":"..."} or {"type":"sell","symbol":"...","reason":"..."}],"comment":"one line on your thinking"}`;
+
+  let answer: string;
+  try {
+    answer = await askOllama(prompt, 60_000);
+  } catch (err) {
+    log(`LLM trader: brain unreachable (${(err as Error).message}) — holding`);
+    return;
+  }
+
+  let decision: { actions?: { type?: string; symbol?: string; reason?: string }[]; comment?: string };
+  try {
+    // Reasoning models (deepseek-r1 etc.) prepend <think>...</think> — strip it first.
+    const cleaned = answer.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    decision = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
+  } catch {
+    log(`LLM trader: unparseable answer, holding — "${answer.slice(0, 160)}"`);
+    return;
+  }
+
+  lastLlmComment = (decision.comment ?? '').slice(0, 200);
+  if (lastLlmComment) log(`LLM trader thinks: ${lastLlmComment}`);
+
+  for (const action of (decision.actions ?? []).slice(0, 5)) {
+    const symbol = (action.symbol ?? '').toUpperCase();
+    const reason = `llm: ${(action.reason ?? 'no reason given').slice(0, 120)}`;
+    try {
+      if (action.type === 'sell') {
+        const pos = broker.position(symbol);
+        const price = lastPrice.get(symbol);
+        if (!pos || price === undefined) continue;
+        const fill = await broker.sell(symbol, price, reason);
+        log(`LLM SELL ${symbol} @ ${fill.price} | P&L ${fill.pnlUsdt!.toFixed(2)} ${currency} | ${reason}`);
+      } else if (action.type === 'buy') {
+        if (!symbols.includes(symbol) || broker.position(symbol)) continue;
+        if (broker.openPositions.length >= maxOpen || broker.balanceUsdt < positionQuote) continue;
+        const price = lastPrice.get(symbol);
+        if (price === undefined) continue;
+        const pos = await broker.buy(symbol, positionQuote, price, barIndexNow(), reason);
+        log(`LLM BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} | ${reason}`);
+      }
+    } catch (err) {
+      log(`LLM trader: ${action.type} ${symbol} failed: ${(err as Error).message}`);
+    }
+  }
+}
+
 async function main(): Promise<void> {
   if (typeof WebSocket === 'undefined') {
     throw new Error('WebSocket global missing — run via `pnpm crypto:start` (needs --experimental-websocket on Node 20)');
@@ -465,7 +559,9 @@ async function main(): Promise<void> {
   }
 
   if (!isLive) {
-    log('Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
+    log(llmTrader
+      ? `Mode: LLM TRADER (paper, experimental) — decisions by ${llmConfigured ? 'the connected LLM every ${intervalMin} minutes' : 'NOTHING yet: set OLLAMA_URL to connect a brain'}`
+      : 'Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
   }
 
   log(broker.summary());
@@ -496,8 +592,12 @@ async function main(): Promise<void> {
     quotes.set(symbol, { bid, ask }),
   );
 
-  setInterval(() => void refreshStats(), intervalMin * 60 * 1000);
-  setInterval(() => void refreshRegime(), intervalMin * 60 * 1000);
+  setInterval(() => {
+    void refreshStats().then(() => {
+      if (llmTrader) void llmTradeCycle();
+    });
+    void refreshRegime();
+  }, intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
   setTimeout(heartbeat, 5_000);
 }

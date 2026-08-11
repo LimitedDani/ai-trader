@@ -33,6 +33,23 @@ const VERDICT_TTL_MS = 10 * 60 * 1000;
 const NEWS_REFRESH_MS = 5 * 60 * 1000;
 
 export const llmVetoEnabled = Boolean(OLLAMA_URL);
+export const llmConfigured = Boolean(OLLAMA_URL);
+
+/** Current cached headlines (refreshed every few minutes when the LLM is on). */
+export function currentHeadlines(): string[] {
+  return headlines;
+}
+
+/** Generic ask against the configured Ollama backend. Throws on failure. */
+export async function askOllama(prompt: string, timeoutMs = TIMEOUT_MS): Promise<string> {
+  const res = await ollamaFetch('/api/generate', {
+    method: 'POST',
+    body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  if (!res.ok) throw new Error(`ollama ${res.status}`);
+  return ((await res.json()) as { response?: string }).response ?? '';
+}
 
 let headlines: string[] = [];
 const verdicts = new Map<string, { veto: boolean; at: number; note: string }>();
