@@ -145,6 +145,10 @@ export class BitvavoClient {
     return Number(rows[0]?.available ?? 0);
   }
 
+  // Bitvavo (MiCA) requires an integer identifying which trader/bot placed
+  // each order. Any consistent number works for a single-bot account.
+  private readonly operatorId = Number(process.env.BITVAVO_OPERATOR_ID ?? 1001);
+
   /** Market buy spending `quoteAmount` EUR. Returns actual base qty and EUR cost. */
   async marketBuy(market: string, quoteAmount: number): Promise<{ qtyBase: number; costQuote: number; price: number; feeQuote: number }> {
     const order = await this.signed<OrderResponse>('POST', '/order', {
@@ -153,6 +157,7 @@ export class BitvavoClient {
       orderType: 'market',
       amountQuote: quoteAmount.toFixed(2),
       disableMarketProtection: false,
+      operatorId: this.operatorId,
     });
     if (order.status !== 'filled') throw new Error(`${market} buy not filled (status ${order.status})`);
     const qtyBase = Number(order.filledAmount);
@@ -172,6 +177,7 @@ export class BitvavoClient {
       orderType: 'market',
       amount: String(qty),
       disableMarketProtection: false,
+      operatorId: this.operatorId,
     });
     if (order.status !== 'filled') throw new Error(`${market} sell not filled (status ${order.status})`);
     const gross = Number(order.filledAmountQuote);

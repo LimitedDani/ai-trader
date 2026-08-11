@@ -105,6 +105,8 @@ const data = isLive
 const statsBySymbol = new Map<string, Stats>();
 const lastPrice = new Map<string, number>();
 const busy = new Set<string>();
+const errorCooldownUntil = new Map<string, number>(); // per-symbol backoff after order errors
+const ERROR_COOLDOWN_MS = 5 * 60 * 1000;
 let firstTickLogged = false;
 let ticksSinceHeartbeat = 0;
 let totalTicks = 0;
@@ -163,6 +165,7 @@ function onTick(symbol: string, price: number): void {
   totalTicks++;
   lastPrice.set(symbol, price);
   if (busy.has(symbol)) return;
+  if ((errorCooldownUntil.get(symbol) ?? 0) > Date.now()) return;
   const stats = statsBySymbol.get(symbol);
   if (!stats) return;
 
@@ -197,7 +200,8 @@ function onTick(symbol: string, price: number): void {
         );
       }
     } catch (err) {
-      log(`ERROR ${symbol}: ${(err as Error).message}`);
+      errorCooldownUntil.set(symbol, Date.now() + ERROR_COOLDOWN_MS);
+      log(`ERROR ${symbol}: ${(err as Error).message} — cooling down ${symbol} for ${ERROR_COOLDOWN_MS / 60000}min`);
     } finally {
       busy.delete(symbol);
     }
