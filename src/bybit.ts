@@ -1,9 +1,8 @@
 /**
- * Minimal Bybit v5 API client. Public market data needs no keys;
- * trading calls are HMAC-signed and target the TESTNET by default.
+ * Bybit v5 PUBLIC market data client — no account or keys required.
+ * (Order execution is simulated locally by PaperBroker; Bybit's testnet
+ * and self-generated live keys are not available to NL/EU accounts.)
  */
-import { createHmac } from 'node:crypto';
-
 const PUBLIC_URL = 'https://api.bybit.com';
 
 export interface Kline {
@@ -66,61 +65,3 @@ export async function fetchKlines(symbol: string, intervalMin: number, days: num
     .sort((a, b) => a.t - b.t);
 }
 
-/** Signed trading client — pass testnet keys; base URL defaults to testnet. */
-export class BybitTrading {
-  constructor(
-    private readonly apiKey: string,
-    private readonly apiSecret: string,
-    private readonly baseUrl = 'https://api-testnet.bybit.com',
-  ) {}
-
-  get isTestnet(): boolean {
-    return this.baseUrl.includes('testnet');
-  }
-
-  private async signed<T>(method: 'GET' | 'POST', path: string, params: Record<string, unknown>): Promise<T> {
-    const timestamp = String(Date.now());
-    const recvWindow = '5000';
-    const payload =
-      method === 'GET'
-        ? new URLSearchParams(params as Record<string, string>).toString()
-        : JSON.stringify(params);
-    const sign = createHmac('sha256', this.apiSecret)
-      .update(timestamp + this.apiKey + recvWindow + payload)
-      .digest('hex');
-
-    const url = method === 'GET' ? `${this.baseUrl}${path}?${payload}` : `${this.baseUrl}${path}`;
-    const res = await fetch(url, {
-      method,
-      headers: {
-        'X-BAPI-API-KEY': this.apiKey,
-        'X-BAPI-TIMESTAMP': timestamp,
-        'X-BAPI-RECV-WINDOW': recvWindow,
-        'X-BAPI-SIGN': sign,
-        'Content-Type': 'application/json',
-      },
-      body: method === 'POST' ? payload : undefined,
-    });
-    if (!res.ok) throw new Error(`Bybit ${method} ${path}: ${res.status} ${await res.text()}`);
-    const body = (await res.json()) as BybitResponse<T>;
-    if (body.retCode !== 0) throw new Error(`Bybit ${path}: ${body.retMsg} (${body.retCode})`);
-    return body.result;
-  }
-
-  balance(): Promise<{ list: { totalEquity: string }[] }> {
-    return this.signed('GET', '/v5/account/wallet-balance', { accountType: 'UNIFIED' });
-  }
-
-  marketOrder(symbol: string, side: 'Buy' | 'Sell', qty: string): Promise<{ orderId: string }> {
-    return this.signed('POST', '/v5/order/create', {
-      category: 'spot',
-      symbol,
-      side,
-      orderType: 'Market',
-      qty,
-      // For spot market buys Bybit expects qty in quote currency (USDT) by default;
-      // marketUnit makes the unit explicit.
-      marketUnit: side === 'Buy' ? 'quoteCoin' : 'baseCoin',
-    });
-  }
-}
