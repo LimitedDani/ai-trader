@@ -11,7 +11,13 @@
  */
 import { fetchKlines } from './bybit.js';
 import { PaperBroker } from './paperBroker.js';
-import { DEFAULT_FAST_PARAMS, shouldEnter, shouldExit, type FastParams } from './fastStrategy.js';
+import {
+  DEFAULT_FAST_PARAMS,
+  rollingStats,
+  shouldEnter,
+  shouldExit,
+  type FastParams,
+} from './fastStrategy.js';
 
 const symbols = (process.env.FAST_SYMBOLS ?? 'BTCUSDT,ETHUSDT,SOLUSDT')
   .split(',')
@@ -33,14 +39,16 @@ const params: FastParams = {
 const broker = new PaperBroker(params.feePctPerSide);
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
-async function tickSymbol(symbol: string, barIndexNow: number): Promise<void> {
+async function tickSymbol(symbol: string, barIndexNow: number): Promise<string> {
   const klines = await fetchKlines(symbol, intervalMin, 1);
   const closed = klines.slice(0, -1); // drop the still-forming bar
   const closes = closed.map((k) => k.c);
-  if (closes.length < params.lookback + 2) return;
+  if (closes.length < params.lookback + 2) return `${symbol} warming up`;
 
   const price = closes[closes.length - 1]!;
+  const stats = rollingStats(closes, params.lookback);
   const open = broker.position(symbol);
+  const status = `${symbol} ${price} z=${stats ? stats.z.toFixed(2) : '?'}${open ? ` [holding, entry ${open.entry}]` : ''}`;
 
   if (open) {
     const reason = shouldExit(closes, open.entry, barIndexNow - open.enteredAtBar, params);
@@ -51,14 +59,11 @@ async function tickSymbol(symbol: string, barIndexNow: number): Promise<void> {
           `P&L ${fill.pnlUsdt!.toFixed(2)} USDT | ${broker.summary()}`,
       );
     }
-    return;
+    return status;
   }
 
-  if (broker.openPositions.length >= maxOpen) return;
-  if (broker.balanceUsdt < positionUsdt) {
-    log(`Paper wallet too low for a new position (${broker.balanceUsdt.toFixed(2)} USDT)`);
-    return;
-  }
+  if (broker.openPositions.length >= maxOpen) return status;
+  if (broker.balanceUsdt < positionUsdt) return `${status} (wallet too low for new position)`;
 
   if (shouldEnter(closes, params)) {
     const pos = broker.buy(symbol, positionUsdt, price, barIndexNow);
@@ -67,6 +72,7 @@ async function tickSymbol(symbol: string, barIndexNow: number): Promise<void> {
         `stop ${(price * (1 - params.stopLossPct / 100)).toFixed(2)} | ${broker.summary()}`,
     );
   }
+  return status;
 }
 
 async function main(): Promise<void> {
@@ -75,15 +81,19 @@ async function main(): Promise<void> {
   log(`Symbols: ${symbols.join(', ')} | ${positionUsdt} USDT/trade, max ${maxOpen} open`);
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
 
+  log(`Entry trigger: z < -${params.zEntry} (roughly once a day per symbol — patience is the strategy)`);
+
   for (;;) {
     const barIndexNow = Math.floor(Date.now() / (intervalMin * 60 * 1000));
+    const statuses: string[] = [];
     for (const symbol of symbols) {
       try {
-        await tickSymbol(symbol, barIndexNow);
+        statuses.push(await tickSymbol(symbol, barIndexNow));
       } catch (err) {
         log(`ERROR ${symbol}: ${(err as Error).message}`);
       }
     }
+    log(statuses.join(' | '));
     await new Promise((resolve) => setTimeout(resolve, pollSeconds * 1000));
   }
 }
