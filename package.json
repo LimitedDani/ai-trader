@@ -10,6 +10,9 @@
     "build": "tsc",
     "start": "node --env-file=.env dist/index.js",
     "backtest": "node --env-file=.env dist/backtest.js",
+    "sweep": "node --env-file=.env dist/sweep.js",
+    "crypto:backtest": "node dist/cryptoBacktest.js",
+    "crypto:start": "node --env-file=.env dist/cryptoBot.js",
     "dev": "tsc && node --env-file=.env dist/index.js"
   },
   "devDependencies": {
