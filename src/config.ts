@@ -23,7 +23,12 @@ export const config = {
   dataUrl: process.env.ALPACA_DATA_URL ?? 'https://data.alpaca.markets',
   symbols: (process.env.SYMBOLS ?? 'SPY')
     .split(',')
-    .map((s) => s.trim().toUpperCase())
+    .map((s: string) => s.trim().toUpperCase())
+    .filter(Boolean),
+  // Crypto pairs like BTC/USD — backtest/sweep only for now; the live loop trades stocks.
+  cryptoSymbols: (process.env.CRYPTO_SYMBOLS ?? 'BTC/USD,ETH/USD')
+    .split(',')
+    .map((s: string) => s.trim().toUpperCase())
     .filter(Boolean),
   fastSma: num('FAST_SMA', 9),
   slowSma: num('SLOW_SMA', 21),
