@@ -6,6 +6,7 @@ import { createServer } from 'node:http';
 
 export interface DashboardState {
   mode: string;
+  currency: string;
   params: Record<string, number | string>;
   symbols: {
     symbol: string;
@@ -46,7 +47,7 @@ export type TradeResult = { ok: boolean; message: string };
 export function startDashboard(
   port: number,
   getState: () => DashboardState,
-  onTrade: (t: TradeAction) => TradeResult,
+  onTrade: (t: TradeAction) => TradeResult | Promise<TradeResult>,
   log: (msg: string) => void,
 ): void {
   const server = createServer((req, res) => {
@@ -59,19 +60,21 @@ export function startDashboard(
       let body = '';
       req.on('data', (chunk) => (body += chunk));
       req.on('end', () => {
-        let result: TradeResult;
-        try {
-          const t = JSON.parse(body) as TradeAction;
-          if ((t.action !== 'buy' && t.action !== 'sell') || typeof t.symbol !== 'string') {
-            result = { ok: false, message: 'invalid request' };
-          } else {
-            result = onTrade({ action: t.action, symbol: t.symbol.toUpperCase() });
+        void (async () => {
+          let result: TradeResult;
+          try {
+            const t = JSON.parse(body) as TradeAction;
+            if ((t.action !== 'buy' && t.action !== 'sell') || typeof t.symbol !== 'string') {
+              result = { ok: false, message: 'invalid request' };
+            } else {
+              result = await onTrade({ action: t.action, symbol: t.symbol.toUpperCase() });
+            }
+          } catch (err) {
+            result = { ok: false, message: (err as Error).message };
           }
-        } catch (err) {
-          result = { ok: false, message: (err as Error).message };
-        }
-        res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(result));
+          res.writeHead(result.ok ? 200 : 400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(result));
+        })();
       });
       return;
     }
@@ -190,7 +193,7 @@ const PAGE = /* html */ `<!doctype html>
 </section>
 
 <section>
-  <h2>Equity (mark-to-market, USDT)</h2>
+  <h2 id="eqTitle">Equity</h2>
   <div id="chartwrap">
     <svg id="chart" width="100%" height="220" role="img" aria-label="Equity over time"></svg>
     <div id="tooltip"></div>
@@ -217,7 +220,8 @@ function toast(msg) {
 }
 
 async function trade(action, symbol, btn) {
-  if (!confirm(action.toUpperCase() + ' ' + symbol + ' (paper)?')) return;
+  const live = document.getElementById('mode').textContent.startsWith('LIVE');
+  if (!confirm(action.toUpperCase() + ' ' + symbol + (live ? ' — REAL MONEY?' : ' (paper)?'))) return;
   btn.disabled = true;
   try {
     const res = await fetch('/api/trade', {
@@ -237,7 +241,7 @@ const pnlCell = (v, suffix = '') => {
   return '<span class="' + cls + '">' + arrow + ' ' + fmt(Math.abs(v)) + suffix + '</span>';
 };
 
-let lastTicks = null, lastTime = null;
+let lastTicks = null, lastTime = null, cur = 'USDT';
 
 async function refresh() {
   let s;
@@ -249,7 +253,12 @@ async function refresh() {
     return;
   }
 
-  document.getElementById('mode').textContent = s.mode;
+  cur = s.currency || 'USDT';
+  const modeEl = document.getElementById('mode');
+  modeEl.textContent = s.mode;
+  modeEl.style.color = s.mode.startsWith('LIVE') ? 'var(--bad)' : '';
+  modeEl.style.borderColor = s.mode.startsWith('LIVE') ? 'var(--bad)' : '';
+  document.getElementById('eqTitle').textContent = 'Equity (mark-to-market, ' + cur + ')';
   document.getElementById('params').textContent =
     'z<-' + s.params.zEntry + ' · SL ' + s.params.stopLossPct + '% · fee ' + s.params.feePctPerSide + '%/side';
 
@@ -263,9 +272,9 @@ async function refresh() {
   const w = s.wallet;
   const winRate = w.closedCount ? Math.round(100 * w.wins / w.closedCount) + '%' : '—';
   document.getElementById('tiles').innerHTML = [
-    ['Equity now', fmt(w.equityNow) + ' <small>USDT</small>'],
-    ['Cash', fmt(w.usdt) + ' <small>USDT</small>'],
-    ['Realized P&L', pnlCell(w.realizedPnl, ' USDT')],
+    ['Equity now', fmt(w.equityNow) + ' <small>' + cur + '</small>'],
+    ['Cash', fmt(w.usdt) + ' <small>' + cur + '</small>'],
+    ['Realized P&L', pnlCell(w.realizedPnl, ' ' + cur)],
     ['Closed trades', w.closedCount + ' <small>win ' + winRate + '</small>'],
     ['Open positions', w.openCount],
     ['Ticks evaluated', tickRate],
@@ -300,7 +309,7 @@ async function refresh() {
     : '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Now</th><th class="num">Unrealized P&L</th><th class="num">z now</th><th class="num">Stop</th><th class="num">Held</th><th></th></tr></thead><tbody>' +
       s.positions.map(p =>
         '<tr><td>' + p.symbol + '</td><td class="num">' + fmt(p.qtyBase, 6) + '</td><td class="num">' + px(p.entry) +
-        '</td><td class="num">' + px(p.current) + '</td><td class="num">' + pnlCell(p.unrealizedPnl, ' USDT') +
+        '</td><td class="num">' + px(p.current) + '</td><td class="num">' + pnlCell(p.unrealizedPnl, ' ' + cur) +
         '</td><td class="num">' + (p.z == null ? '—' : fmt(p.z)) +
         '</td><td class="num">' + px(p.stopPrice) +
         '</td><td class="num">' + p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm</td>' +
@@ -313,7 +322,7 @@ async function refresh() {
     : '<table><thead><tr><th>Time</th><th>Symbol</th><th class="num">Exit price</th><th>Reason</th><th class="num">P&L</th></tr></thead><tbody>' +
       sells.map(f =>
         '<tr><td>' + new Date(f.time).toLocaleString() + '</td><td>' + f.symbol + '</td><td class="num">' + fmt(f.price) +
-        '</td><td>' + (f.reason || '') + '</td><td class="num">' + pnlCell(f.pnlUsdt, ' USDT') + '</td></tr>').join('') +
+        '</td><td>' + (f.reason || '') + '</td><td class="num">' + pnlCell(f.pnlUsdt, ' ' + cur) + '</td></tr>').join('') +
       '</tbody></table>';
 
   drawChart(s.equitySeries);
@@ -368,7 +377,7 @@ wrap.addEventListener('mousemove', e => {
   tip.style.display = 'block';
   tip.style.left = Math.min(best.px + 12, rect.width - 170) + 'px';
   tip.style.top = (best.py - 36) + 'px';
-  tip.innerHTML = '<strong>' + fmt(best.v) + ' USDT</strong><br>' + new Date(best.t).toLocaleString();
+  tip.innerHTML = '<strong>' + fmt(best.v) + ' ' + cur + '</strong><br>' + new Date(best.t).toLocaleString();
 });
 wrap.addEventListener('mouseleave', () => {
   document.getElementById('tooltip').style.display = 'none';

@@ -1,19 +1,21 @@
 /**
- * Fast crypto mean-reversion bot — local PAPER trading, tick-level reaction.
+ * Fast crypto mean-reversion bot with two modes, switched by TRADE_MODE:
  *
- * Prices stream in real time over Bybit's public websocket (no account).
- * The statistical baseline (rolling mean/std) is recomputed from closed
- * 5-min bars; every tick is checked against it instantly, so entries,
- * stop-losses and reversion exits fire within milliseconds of the price
- * crossing the line — not at the next poll.
+ *   paper (default) — Bybit public prices, simulated fills via PaperBroker,
+ *                     no account or keys needed. State: paper-state.json.
+ *   live            — Bitvavo EUR spot, REAL market orders via LiveBroker.
+ *                     Needs BITVAVO_API_KEY / BITVAVO_API_SECRET in .env
+ *                     (trade permission only — never enable withdrawals).
+ *                     State: live-state.json.
  *
- * Fills are simulated locally by PaperBroker (fees included) and persist
- * in paper-state.json. Delete that file to reset the paper wallet.
- *
+ * Same strategy, dashboard and manual buttons in both modes.
  * Usage: pnpm build && pnpm crypto:start
  */
-import { fetchKlines, fetchTopSymbols, streamPrices } from './bybit.js';
+import * as bybit from './bybit.js';
+import * as bitvavo from './bitvavo.js';
+import { BitvavoClient } from './bitvavo.js';
 import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
+import { LiveBroker } from './liveBroker.js';
 import { PaperBroker } from './paperBroker.js';
 import {
   DEFAULT_FAST_PARAMS,
@@ -24,32 +26,87 @@ import {
   type Stats,
 } from './fastStrategy.js';
 
-// FAST_SYMBOLS is either a comma list, or TOP<n> (e.g. TOP30) to auto-select
-// the n highest-volume USDT pairs on Bybit at startup.
-const symbolsEnv = (process.env.FAST_SYMBOLS ?? 'BTCUSDT,ETHUSDT,SOLUSDT').trim().toUpperCase();
+const mode = (process.env.TRADE_MODE ?? 'paper').toLowerCase();
+if (mode !== 'paper' && mode !== 'live') throw new Error(`TRADE_MODE must be "paper" or "live", got "${mode}"`);
+const isLive = mode === 'live';
+const currency = isLive ? 'EUR' : 'USDT';
+
+const symbolsEnv = (
+  process.env.FAST_SYMBOLS ?? (isLive ? 'BTC-EUR,ETH-EUR,SOL-EUR' : 'BTCUSDT,ETHUSDT,SOLUSDT')
+).trim().toUpperCase();
 let symbols: string[] = [];
-const positionUsdt = Number(process.env.FAST_POSITION_USDT ?? 200);
+
+const positionQuote = Number(process.env.FAST_POSITION_USDT ?? (isLive ? 10 : 200));
 const maxOpen = Number(process.env.FAST_MAX_OPEN ?? 2);
+const maxDailyLoss = Number(process.env.FAST_MAX_DAILY_LOSS ?? (isLive ? 5 : 100));
 const intervalMin = 5;
 const heartbeatSeconds = 60;
 
-// Best sweep combo that stayed positive in validation (see cryptoBacktest.ts).
 const params: FastParams = {
   ...DEFAULT_FAST_PARAMS,
   zEntry: Number(process.env.FAST_Z_ENTRY ?? 2.5),
   stopLossPct: Number(process.env.FAST_STOP_LOSS_PCT ?? 2.5),
   maxHoldBars: Number(process.env.FAST_MAX_HOLD_BARS ?? 72),
+  // Bitvavo taker fee is 0.25%/side at the entry tier — 2.5x the paper sim.
+  feePctPerSide: Number(process.env.FAST_FEE_PCT ?? (isLive ? 0.25 : 0.1)),
 };
 
-const broker = new PaperBroker(params.feePctPerSide);
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
+
+function makeBroker(): PaperBroker | LiveBroker {
+  if (!isLive) return new PaperBroker(params.feePctPerSide);
+  const apiKey = process.env.BITVAVO_API_KEY;
+  const apiSecret = process.env.BITVAVO_API_SECRET;
+  if (!apiKey || !apiSecret) {
+    throw new Error('TRADE_MODE=live needs BITVAVO_API_KEY / BITVAVO_API_SECRET in .env (trade-only key, no withdrawal permission)');
+  }
+  return new LiveBroker(new BitvavoClient(apiKey, apiSecret));
+}
+const broker = makeBroker();
+
+// Mode-specific data plumbing; everything below it is shared.
+const data = isLive
+  ? {
+      recentCloses: async (symbol: string) => {
+        const klines = await bitvavo.fetchCandles(symbol, intervalMin, params.lookback + 10);
+        return klines.slice(0, -1).map((k) => k.c);
+      },
+      topSymbols: (n: number) => bitvavo.fetchTopMarkets(n),
+      stream: bitvavo.streamTrades,
+    }
+  : {
+      recentCloses: async (symbol: string) => {
+        const klines = await bybit.fetchKlines(symbol, intervalMin, 1);
+        return klines.slice(0, -1).map((k) => k.c);
+      },
+      topSymbols: (n: number) => bybit.fetchTopSymbols(n),
+      stream: bybit.streamPrices,
+    };
 
 const statsBySymbol = new Map<string, Stats>();
 const lastPrice = new Map<string, number>();
-const busy = new Set<string>(); // guards against double-acting while a tick is processed
+const busy = new Set<string>();
+let firstTickLogged = false;
+let ticksSinceHeartbeat = 0;
+let totalTicks = 0;
 
 function barIndexNow(): number {
   return Math.floor(Date.now() / (intervalMin * 60 * 1000));
+}
+
+function currentZ(symbol: string): number | null {
+  const price = lastPrice.get(symbol);
+  const stats = statsBySymbol.get(symbol);
+  if (price === undefined || !stats) return null;
+  return (price - stats.mean) / stats.std;
+}
+
+function realizedToday(): number {
+  const midnight = new Date();
+  midnight.setHours(0, 0, 0, 0);
+  return broker.allFills
+    .filter((f) => f.side === 'Sell' && new Date(f.time) >= midnight)
+    .reduce((s, f) => s + (f.pnlUsdt ?? 0), 0);
 }
 
 async function refreshStats(): Promise<void> {
@@ -57,8 +114,7 @@ async function refreshStats(): Promise<void> {
     await Promise.all(
       symbols.slice(i, i + 10).map(async (symbol) => {
         try {
-          const klines = await fetchKlines(symbol, intervalMin, 1);
-          const closes = klines.slice(0, -1).map((k) => k.c); // closed bars only
+          const closes = await data.recentCloses(symbol);
           const stats = rollingStats(closes, params.lookback);
           if (stats) statsBySymbol.set(symbol, stats);
         } catch (err) {
@@ -68,10 +124,6 @@ async function refreshStats(): Promise<void> {
     );
   }
 }
-
-let firstTickLogged = false;
-let ticksSinceHeartbeat = 0;
-let totalTicks = 0;
 
 function onTick(symbol: string, price: number): void {
   if (!firstTickLogged) {
@@ -86,42 +138,40 @@ function onTick(symbol: string, price: number): void {
   if (!stats) return;
 
   busy.add(symbol);
-  try {
-    const open = broker.position(symbol);
+  void (async () => {
+    try {
+      const open = broker.position(symbol);
 
-    if (open) {
-      const barsHeld = barIndexNow() - open.enteredAtBar;
-      const reason = shouldExitAtPrice(price, stats, open.entry, barsHeld, params);
-      if (reason) {
-        const fill = broker.sell(symbol, price, reason);
+      if (open) {
+        const barsHeld = barIndexNow() - open.enteredAtBar;
+        const reason = shouldExitAtPrice(price, stats, open.entry, barsHeld, params);
+        if (reason) {
+          const fill = await broker.sell(symbol, price, reason);
+          log(
+            `SELL ${symbol} ${fill.qtyBase.toFixed(6)} @ ${fill.price} | ${reason} | ` +
+              `P&L ${fill.pnlUsdt!.toFixed(2)} ${currency} | ${broker.summary()}`,
+          );
+        }
+        return;
+      }
+
+      if (broker.openPositions.length >= maxOpen) return;
+      if (broker.balanceUsdt < positionQuote) return;
+      if (realizedToday() <= -maxDailyLoss) return; // kill switch: no new entries today
+
+      if (shouldEnterAtPrice(price, stats, params)) {
+        const pos = await broker.buy(symbol, positionQuote, price, barIndexNow());
         log(
-          `SELL ${symbol} ${fill.qtyBase.toFixed(6)} @ ${price} | ${reason} | ` +
-            `P&L ${fill.pnlUsdt!.toFixed(2)} USDT | ${broker.summary()}`,
+          `BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} (${positionQuote} ${currency}), ` +
+            `stop ${(pos.entry * (1 - params.stopLossPct / 100)).toFixed(4)} | ${broker.summary()}`,
         );
       }
-      return;
+    } catch (err) {
+      log(`ERROR ${symbol}: ${(err as Error).message}`);
+    } finally {
+      busy.delete(symbol);
     }
-
-    if (broker.openPositions.length >= maxOpen) return;
-    if (broker.balanceUsdt < positionUsdt) return;
-
-    if (shouldEnterAtPrice(price, stats, params)) {
-      const pos = broker.buy(symbol, positionUsdt, price, barIndexNow());
-      log(
-        `BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${price} (${positionUsdt} USDT), ` +
-          `stop ${(price * (1 - params.stopLossPct / 100)).toFixed(2)} | ${broker.summary()}`,
-      );
-    }
-  } finally {
-    busy.delete(symbol);
-  }
-}
-
-function currentZ(symbol: string): number | null {
-  const price = lastPrice.get(symbol);
-  const stats = statsBySymbol.get(symbol);
-  if (price === undefined || !stats) return null;
-  return (price - stats.mean) / stats.std;
+  })();
 }
 
 function heartbeat(): void {
@@ -130,7 +180,7 @@ function heartbeat(): void {
     .filter((s): s is { symbol: string; z: number } => s.z !== null)
     .sort((a, b) => a.z - b.z);
 
-  const shown = scored.slice(0, 5); // the ones closest to a buy signal
+  const shown = scored.slice(0, 5);
   const parts = shown.map(({ symbol, z }) => {
     const open = broker.position(symbol);
     return `${symbol} z=${z.toFixed(2)}${open ? ' [holding]' : ''}`;
@@ -154,7 +204,6 @@ function buildDashboardState(): DashboardState {
     0,
   );
 
-  // Equity curve: realized equity after each closed trade, plus a live point.
   let running = broker.startUsdt;
   const equitySeries: { t: string; v: number }[] = [
     ...(sells.length > 0 ? [{ t: sells[0]!.time, v: broker.startUsdt }] : []),
@@ -166,7 +215,8 @@ function buildDashboardState(): DashboardState {
   equitySeries.push({ t: new Date().toISOString(), v: broker.balanceUsdt + marketValue });
 
   return {
-    mode: 'paper trading (live prices)',
+    mode: isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
+    currency,
     params: {
       zEntry: params.zEntry,
       stopLossPct: params.stopLossPct,
@@ -219,7 +269,7 @@ function buildDashboardState(): DashboardState {
   };
 }
 
-function handleManualTrade({ action, symbol }: TradeAction): TradeResult {
+async function handleManualTrade({ action, symbol }: TradeAction): Promise<TradeResult> {
   if (!symbols.includes(symbol)) return { ok: false, message: `${symbol} is not tracked by this bot` };
   const price = lastPrice.get(symbol);
   if (price === undefined) return { ok: false, message: `${symbol}: no live price yet` };
@@ -227,18 +277,18 @@ function handleManualTrade({ action, symbol }: TradeAction): TradeResult {
   try {
     if (action === 'buy') {
       if (broker.position(symbol)) return { ok: false, message: `${symbol}: already holding` };
-      if (broker.balanceUsdt < positionUsdt) {
-        return { ok: false, message: `insufficient paper USDT (${broker.balanceUsdt.toFixed(2)})` };
+      if (broker.balanceUsdt < positionQuote) {
+        return { ok: false, message: `insufficient ${currency} (${broker.balanceUsdt.toFixed(2)})` };
       }
-      const pos = broker.buy(symbol, positionUsdt, price, barIndexNow(), 'manual');
-      log(`MANUAL BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${price} | ${broker.summary()}`);
-      return { ok: true, message: `Bought ${symbol} @ ${price} — bot manages the exit (stop/revert/timeout)` };
+      const pos = await broker.buy(symbol, positionQuote, price, barIndexNow(), 'manual');
+      log(`MANUAL BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} | ${broker.summary()}`);
+      return { ok: true, message: `Bought ${symbol} @ ${pos.entry} — bot manages the exit (stop/revert/timeout)` };
     }
     const open = broker.position(symbol);
     if (!open) return { ok: false, message: `${symbol}: no open position` };
-    const fill = broker.sell(symbol, price, 'manual');
-    log(`MANUAL SELL ${symbol} @ ${price} | P&L ${fill.pnlUsdt!.toFixed(2)} USDT | ${broker.summary()}`);
-    return { ok: true, message: `Sold ${symbol} @ ${price} — P&L ${fill.pnlUsdt!.toFixed(2)} USDT` };
+    const fill = await broker.sell(symbol, price, 'manual');
+    log(`MANUAL SELL ${symbol} @ ${fill.price} | P&L ${fill.pnlUsdt!.toFixed(2)} ${currency} | ${broker.summary()}`);
+    return { ok: true, message: `Sold ${symbol} @ ${fill.price} — P&L ${fill.pnlUsdt!.toFixed(2)} ${currency}` };
   } catch (err) {
     return { ok: false, message: (err as Error).message };
   }
@@ -251,28 +301,37 @@ async function main(): Promise<void> {
 
   const topMatch = /^TOP(\d+)$/.exec(symbolsEnv);
   if (topMatch) {
-    const n = Math.min(Number(topMatch[1]), 50); // websocket/refresh sanity cap
-    symbols = await fetchTopSymbols(n);
-    log(`Auto-selected top ${symbols.length} USDT pairs by 24h volume`);
+    const n = Math.min(Number(topMatch[1]), 50);
+    symbols = await data.topSymbols(n);
+    log(`Auto-selected top ${symbols.length} ${isLive ? 'EUR' : 'USDT'} pairs by 24h volume`);
   } else {
     symbols = symbolsEnv.split(',').map((s) => s.trim()).filter(Boolean);
   }
 
-  log('Mode: LOCAL PAPER TRADING (streaming Bybit prices, simulated fills, no real money)');
+  if (isLive) {
+    log('Mode: *** LIVE — REAL MONEY on Bitvavo ***');
+    log(`Safety rails: ${positionQuote} EUR/trade, max ${maxOpen} open, kill switch at -${maxDailyLoss} EUR/day`);
+    log('Starting in 30 seconds — Ctrl+C now to abort.');
+    await new Promise((resolve) => setTimeout(resolve, 30_000));
+    await (broker as LiveBroker).refreshBalance();
+    setInterval(() => void (broker as LiveBroker).refreshBalance().catch((e: Error) => log(`WARN balance: ${e.message}`)), 60_000);
+  } else {
+    log('Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
+  }
+
   log(broker.summary());
-  log(`Symbols (${symbols.length}): ${symbols.join(', ')} | ${positionUsdt} USDT/trade, max ${maxOpen} open`);
+  log(`Symbols (${symbols.length}): ${symbols.join(', ')} | ${positionQuote} ${currency}/trade, max ${maxOpen} open`);
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
-  log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry} — a few signals/day is normal.`);
+  log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry}.`);
 
   startDashboard(Number(process.env.DASH_PORT ?? 8787), buildDashboardState, handleManualTrade, log);
 
   await refreshStats();
-  streamPrices(symbols, onTick, log);
+  data.stream(symbols, onTick, log);
 
-  // Recompute bar statistics shortly after each 5-min bar closes.
   setInterval(() => void refreshStats(), intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
-  setTimeout(heartbeat, 5_000); // first heartbeat after the stream has had a moment
+  setTimeout(heartbeat, 5_000);
 }
 
 main().catch((err) => {
