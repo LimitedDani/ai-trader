@@ -64,7 +64,13 @@ async function refreshStats(): Promise<void> {
   }
 }
 
+let firstTickLogged = false;
+
 function onTick(symbol: string, price: number): void {
+  if (!firstTickLogged) {
+    firstTickLogged = true;
+    log(`first tick received (${symbol} @ ${price}) — stream is live`);
+  }
   lastPrice.set(symbol, price);
   if (busy.has(symbol)) return;
   const stats = statsBySymbol.get(symbol);
@@ -126,12 +132,12 @@ async function main(): Promise<void> {
   log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry} — a few signals/day is normal.`);
 
   await refreshStats();
-  streamPrices(symbols, onTick);
+  streamPrices(symbols, onTick, log);
 
   // Recompute bar statistics shortly after each 5-min bar closes.
   setInterval(() => void refreshStats(), intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
-  heartbeat();
+  setTimeout(heartbeat, 5_000); // first heartbeat after the stream has had a moment
 }
 
 main().catch((err) => {

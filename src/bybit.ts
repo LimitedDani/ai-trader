@@ -70,7 +70,11 @@ export async function fetchKlines(symbol: string, intervalMin: number, days: num
  * Requires Node's WebSocket global (run with --experimental-websocket on Node 20).
  * Reconnects automatically; sends the protocol ping every 20s.
  */
-export function streamPrices(symbols: string[], onPrice: (symbol: string, price: number) => void): void {
+export function streamPrices(
+  symbols: string[],
+  onPrice: (symbol: string, price: number) => void,
+  onStatus: (msg: string) => void = () => {},
+): void {
   const WS_URL = 'wss://stream.bybit.com/v5/public/spot';
 
   function connect(): void {
@@ -80,6 +84,7 @@ export function streamPrices(symbols: string[], onPrice: (symbol: string, price:
     ws.addEventListener('open', () => {
       ws.send(JSON.stringify({ op: 'subscribe', args: symbols.map((s) => `tickers.${s}`) }));
       ping = setInterval(() => ws.send(JSON.stringify({ op: 'ping' })), 20_000);
+      onStatus(`websocket connected, subscribed to ${symbols.length} tickers`);
     });
 
     ws.addEventListener('message', (event) => {
@@ -100,6 +105,7 @@ export function streamPrices(symbols: string[], onPrice: (symbol: string, price:
 
     const reconnect = () => {
       if (ping) clearInterval(ping);
+      onStatus('websocket disconnected, reconnecting in 2s');
       setTimeout(connect, 2_000);
     };
     ws.addEventListener('close', reconnect);
