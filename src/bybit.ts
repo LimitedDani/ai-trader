@@ -65,6 +65,23 @@ export async function fetchKlines(symbol: string, intervalMin: number, days: num
     .sort((a, b) => a.t - b.t);
 }
 
+const STABLE_PAIRS = new Set([
+  'USDCUSDT', 'DAIUSDT', 'TUSDUSDT', 'USDEUSDT', 'FDUSDUSDT', 'EURUSDT', 'USD1USDT', 'PYUSDUSDT',
+]);
+
+/** Top-N USDT spot pairs by 24h turnover (stablecoin pairs excluded). */
+export async function fetchTopSymbols(n: number): Promise<string[]> {
+  const result = await publicGet<{ list: { symbol: string; turnover24h: string }[] }>(
+    '/v5/market/tickers',
+    { category: 'spot' },
+  );
+  return result.list
+    .filter((t) => t.symbol.endsWith('USDT') && !STABLE_PAIRS.has(t.symbol))
+    .sort((a, b) => Number(b.turnover24h) - Number(a.turnover24h))
+    .slice(0, n)
+    .map((t) => t.symbol);
+}
+
 /**
  * Stream real-time last-trade prices over Bybit's public websocket.
  * Requires Node's WebSocket global (run with --experimental-websocket on Node 20).
@@ -82,7 +99,11 @@ export function streamPrices(
     let ping: ReturnType<typeof setInterval> | undefined;
 
     ws.addEventListener('open', () => {
-      ws.send(JSON.stringify({ op: 'subscribe', args: symbols.map((s) => `tickers.${s}`) }));
+      // Bybit caps subscribe requests at 10 topics each — batch them.
+      const topics = symbols.map((s) => `tickers.${s}`);
+      for (let i = 0; i < topics.length; i += 10) {
+        ws.send(JSON.stringify({ op: 'subscribe', args: topics.slice(i, i + 10) }));
+      }
       ping = setInterval(() => ws.send(JSON.stringify({ op: 'ping' })), 20_000);
       onStatus(`websocket connected, subscribed to ${symbols.length} tickers`);
     });

@@ -12,7 +12,7 @@
  *
  * Usage: pnpm build && pnpm crypto:start
  */
-import { fetchKlines, streamPrices } from './bybit.js';
+import { fetchKlines, fetchTopSymbols, streamPrices } from './bybit.js';
 import { startDashboard, type DashboardState } from './dashboard.js';
 import { PaperBroker } from './paperBroker.js';
 import {
@@ -24,10 +24,10 @@ import {
   type Stats,
 } from './fastStrategy.js';
 
-const symbols = (process.env.FAST_SYMBOLS ?? 'BTCUSDT,ETHUSDT,SOLUSDT')
-  .split(',')
-  .map((s) => s.trim().toUpperCase())
-  .filter(Boolean);
+// FAST_SYMBOLS is either a comma list, or TOP<n> (e.g. TOP30) to auto-select
+// the n highest-volume USDT pairs on Bybit at startup.
+const symbolsEnv = (process.env.FAST_SYMBOLS ?? 'BTCUSDT,ETHUSDT,SOLUSDT').trim().toUpperCase();
+let symbols: string[] = [];
 const positionUsdt = Number(process.env.FAST_POSITION_USDT ?? 200);
 const maxOpen = Number(process.env.FAST_MAX_OPEN ?? 2);
 const intervalMin = 5;
@@ -53,15 +53,19 @@ function barIndexNow(): number {
 }
 
 async function refreshStats(): Promise<void> {
-  for (const symbol of symbols) {
-    try {
-      const klines = await fetchKlines(symbol, intervalMin, 1);
-      const closes = klines.slice(0, -1).map((k) => k.c); // closed bars only
-      const stats = rollingStats(closes, params.lookback);
-      if (stats) statsBySymbol.set(symbol, stats);
-    } catch (err) {
-      log(`WARN: stats refresh failed for ${symbol}: ${(err as Error).message}`);
-    }
+  for (let i = 0; i < symbols.length; i += 10) {
+    await Promise.all(
+      symbols.slice(i, i + 10).map(async (symbol) => {
+        try {
+          const klines = await fetchKlines(symbol, intervalMin, 1);
+          const closes = klines.slice(0, -1).map((k) => k.c); // closed bars only
+          const stats = rollingStats(closes, params.lookback);
+          if (stats) statsBySymbol.set(symbol, stats);
+        } catch (err) {
+          log(`WARN: stats refresh failed for ${symbol}: ${(err as Error).message}`);
+        }
+      }),
+    );
   }
 }
 
@@ -113,16 +117,30 @@ function onTick(symbol: string, price: number): void {
   }
 }
 
+function currentZ(symbol: string): number | null {
+  const price = lastPrice.get(symbol);
+  const stats = statsBySymbol.get(symbol);
+  if (price === undefined || !stats) return null;
+  return (price - stats.mean) / stats.std;
+}
+
 function heartbeat(): void {
-  const parts = symbols.map((symbol) => {
-    const price = lastPrice.get(symbol);
-    const stats = statsBySymbol.get(symbol);
-    if (price === undefined || !stats) return `${symbol} warming up`;
-    const z = (price - stats.mean) / stats.std;
+  const scored = symbols
+    .map((symbol) => ({ symbol, z: currentZ(symbol) }))
+    .filter((s): s is { symbol: string; z: number } => s.z !== null)
+    .sort((a, b) => a.z - b.z);
+
+  const shown = scored.slice(0, 5); // the ones closest to a buy signal
+  const parts = shown.map(({ symbol, z }) => {
     const open = broker.position(symbol);
-    return `${symbol} ${price} z=${z.toFixed(2)}${open ? ` [holding, entry ${open.entry}]` : ''}`;
+    return `${symbol} z=${z.toFixed(2)}${open ? ' [holding]' : ''}`;
   });
-  log(`${parts.join(' | ')} || ${ticksSinceHeartbeat} ticks evaluated in last ${heartbeatSeconds}s`);
+  const holding = broker.openPositions.map((p) => p.symbol).join(',');
+  log(
+    `closest to entry: ${parts.join(' | ') || 'warming up'} ` +
+      `|| ${scored.length}/${symbols.length} tracked, holding [${holding}], ` +
+      `${ticksSinceHeartbeat} ticks/${heartbeatSeconds}s — full view on the dashboard`,
+  );
   ticksSinceHeartbeat = 0;
 }
 
@@ -155,16 +173,14 @@ function buildDashboardState(): DashboardState {
       maxHoldBars: params.maxHoldBars,
       feePctPerSide: params.feePctPerSide,
     },
-    symbols: symbols.map((symbol) => {
-      const price = lastPrice.get(symbol) ?? null;
-      const stats = statsBySymbol.get(symbol);
-      return {
+    symbols: symbols
+      .map((symbol) => ({
         symbol,
-        price,
-        z: price !== null && stats ? (price - stats.mean) / stats.std : null,
+        price: lastPrice.get(symbol) ?? null,
+        z: currentZ(symbol),
         holding: broker.position(symbol) !== undefined,
-      };
-    }),
+      }))
+      .sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity)),
     wallet: {
       usdt: broker.balanceUsdt,
       equityNow: broker.balanceUsdt + marketValue,
@@ -196,9 +212,18 @@ async function main(): Promise<void> {
     throw new Error('WebSocket global missing — run via `pnpm crypto:start` (needs --experimental-websocket on Node 20)');
   }
 
+  const topMatch = /^TOP(\d+)$/.exec(symbolsEnv);
+  if (topMatch) {
+    const n = Math.min(Number(topMatch[1]), 50); // websocket/refresh sanity cap
+    symbols = await fetchTopSymbols(n);
+    log(`Auto-selected top ${symbols.length} USDT pairs by 24h volume`);
+  } else {
+    symbols = symbolsEnv.split(',').map((s) => s.trim()).filter(Boolean);
+  }
+
   log('Mode: LOCAL PAPER TRADING (streaming Bybit prices, simulated fills, no real money)');
   log(broker.summary());
-  log(`Symbols: ${symbols.join(', ')} | ${positionUsdt} USDT/trade, max ${maxOpen} open`);
+  log(`Symbols (${symbols.length}): ${symbols.join(', ')} | ${positionUsdt} USDT/trade, max ${maxOpen} open`);
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
   log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry} — a few signals/day is normal.`);
 
