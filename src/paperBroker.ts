@@ -3,8 +3,8 @@
  * State (wallet, positions, trade history) persists to paper-state.json
  * so the bot can be restarted without losing track.
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 
 const STATE_FILE =
   process.env.PAPER_STATE_FILE ?? join(process.env.STATE_DIR ?? '.', 'paper-state.json');
@@ -48,6 +48,7 @@ export class PaperBroker {
   }
 
   private save(): void {
+    mkdirSync(dirname(STATE_FILE), { recursive: true });
     writeFileSync(STATE_FILE, JSON.stringify(this.state, null, 2));
   }
 

@@ -11,8 +11,8 @@
  * Same strategy, dashboard and manual buttons in both modes.
  * Usage: pnpm build && pnpm crypto:start
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
@@ -80,6 +80,7 @@ let buyingEnabled = existsSync(CONTROL_FILE)
 
 function setBuying(enabled: boolean): void {
   buyingEnabled = enabled;
+  mkdirSync(dirname(CONTROL_FILE), { recursive: true });
   writeFileSync(CONTROL_FILE, JSON.stringify({ buyingEnabled }));
   log(`Buying ${enabled ? 'ENABLED' : 'PAUSED'} — exits and manual trades stay active`);
 }

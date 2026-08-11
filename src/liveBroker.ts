@@ -4,8 +4,8 @@
  * orders; tracks strategy state (entries, hold timers, fills) locally in
  * live-state.json since the exchange doesn't know about our positions.
  */
-import { readFileSync, writeFileSync, existsSync } from 'node:fs';
-import { join } from 'node:path';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { dirname, join } from 'node:path';
 import { BitvavoClient } from './bitvavo.js';
 import type { PaperFill, PaperPosition } from './paperBroker.js';
 
@@ -36,6 +36,7 @@ export class LiveBroker {
   }
 
   private save(): void {
+    mkdirSync(dirname(STATE_FILE), { recursive: true });
     writeFileSync(STATE_FILE, JSON.stringify(this.state, null, 2));
   }
 
