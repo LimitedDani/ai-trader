@@ -28,6 +28,9 @@ export interface DashboardState {
     qtyBase: number;
     unrealizedPnl: number | null;
     holdMinutes: number;
+    z: number | null;
+    stopPrice: number;
+    timeoutMinutes: number;
   }[];
   fills: unknown[];
   equitySeries: { t: string; v: number }[];
@@ -159,6 +162,8 @@ const PAGE = /* html */ `<!doctype html>
 
 <script>
 const fmt = (n, d = 2) => n == null ? '—' : Number(n).toLocaleString('en-US', { minimumFractionDigits: d, maximumFractionDigits: d });
+// Adaptive decimals so sub-dollar coins show real movement (0.3196, not 0.32).
+const px = (n) => n == null ? '—' : fmt(n, n >= 100 ? 2 : n >= 1 ? 4 : 6);
 const pnlCell = (v, suffix = '') => {
   if (v == null) return '—';
   const cls = v >= 0 ? 'up' : 'down';
@@ -210,18 +215,21 @@ async function refresh() {
       const triggerFrac = (2 + zEntry) / span;
       bar = '<span class="zbar"><b style="left:' + (triggerFrac * 100) + '%"></b><i style="left:' + (frac * 100) + '%"></i></span>';
     }
-    return '<tr><td>' + row.symbol + '</td><td class="num">' + fmt(row.price, row.price != null && row.price < 10 ? 5 : 2) +
+    return '<tr><td>' + row.symbol + '</td><td class="num">' + px(row.price) +
       '</td><td class="num">' + (row.z == null ? '—' : fmt(row.z)) + '</td><td>' + bar + '</td><td>' +
       (row.holding ? '<span class="hold">holding</span>' : '') + '</td></tr>';
   }).join('');
 
   document.getElementById('positions').innerHTML = s.positions.length === 0
     ? '<div class="empty">None — waiting for a signal.</div>'
-    : '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Now</th><th class="num">Unrealized P&L</th><th class="num">Held</th></tr></thead><tbody>' +
+    : '<table><thead><tr><th>Symbol</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Now</th><th class="num">Unrealized P&L</th><th class="num">z now</th><th class="num">Stop</th><th class="num">Held</th></tr></thead><tbody>' +
       s.positions.map(p =>
-        '<tr><td>' + p.symbol + '</td><td class="num">' + fmt(p.qtyBase, 6) + '</td><td class="num">' + fmt(p.entry) +
-        '</td><td class="num">' + fmt(p.current) + '</td><td class="num">' + pnlCell(p.unrealizedPnl, ' USDT') +
-        '</td><td class="num">' + p.holdMinutes + 'm</td></tr>').join('') + '</tbody></table>';
+        '<tr><td>' + p.symbol + '</td><td class="num">' + fmt(p.qtyBase, 6) + '</td><td class="num">' + px(p.entry) +
+        '</td><td class="num">' + px(p.current) + '</td><td class="num">' + pnlCell(p.unrealizedPnl, ' USDT') +
+        '</td><td class="num">' + (p.z == null ? '—' : fmt(p.z)) +
+        '</td><td class="num">' + px(p.stopPrice) +
+        '</td><td class="num">' + p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm</td></tr>').join('') + '</tbody></table>' +
+      '<div class="empty" style="padding-top:8px">Sells when: z rises to ≥ 0 (price back at its mean — the profit exit) · price hits the stop · or the hold timer runs out.</div>';
 
   const sells = s.fills.filter(f => f.side === 'Sell').slice(-50).reverse();
   document.getElementById('fills').innerHTML = sells.length === 0

@@ -199,6 +199,9 @@ function buildDashboardState(): DashboardState {
         unrealizedPnl:
           current === null ? null : p.qtyBase * current * (1 - params.feePctPerSide / 100) - p.costUsdt,
         holdMinutes: (barIndexNow() - p.enteredAtBar) * intervalMin,
+        z: currentZ(p.symbol),
+        stopPrice: p.entry * (1 - params.stopLossPct / 100),
+        timeoutMinutes: params.maxHoldBars * intervalMin,
       };
     }),
     fills: broker.allFills.slice(-200),
