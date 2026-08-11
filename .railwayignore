@@ -1,0 +1,6 @@
+.env
+node_modules/
+dist/
+paper-state.json
+live-state.json
+control-*.json
