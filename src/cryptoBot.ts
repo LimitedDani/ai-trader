@@ -174,12 +174,21 @@ function buildDashboardState(): DashboardState {
       feePctPerSide: params.feePctPerSide,
     },
     symbols: symbols
-      .map((symbol) => ({
-        symbol,
-        price: lastPrice.get(symbol) ?? null,
-        z: currentZ(symbol),
-        holding: broker.position(symbol) !== undefined,
-      }))
+      .map((symbol) => {
+        const price = lastPrice.get(symbol) ?? null;
+        const stats = statsBySymbol.get(symbol);
+        const volPct = price !== null && stats ? (stats.std / price) * 100 : null;
+        const minVolPct = params.minVolMultiple * ((params.feePctPerSide * 2) / 100) * 100;
+        return {
+          symbol,
+          price,
+          z: currentZ(symbol),
+          holding: broker.position(symbol) !== undefined,
+          volPct,
+          volOk: volPct !== null && volPct >= minVolPct,
+          minVolPct,
+        };
+      })
       .sort((a, b) => (a.z ?? Infinity) - (b.z ?? Infinity)),
     wallet: {
       usdt: broker.balanceUsdt,

@@ -12,6 +12,9 @@ export interface DashboardState {
     price: number | null;
     z: number | null;
     holding: boolean;
+    volPct: number | null;
+    volOk: boolean;
+    minVolPct: number;
   }[];
   wallet: {
     usdt: number;
@@ -135,9 +138,10 @@ const PAGE = /* html */ `<!doctype html>
 <section>
   <h2>Live signals</h2>
   <table>
-    <thead><tr><th>Symbol</th><th class="num">Price</th><th class="num">z-score</th><th>Distance to entry</th><th></th></tr></thead>
+    <thead><tr><th>Symbol</th><th class="num">Price</th><th class="num">z-score</th><th>Distance to entry</th><th class="num">Volatility</th><th></th></tr></thead>
     <tbody id="signals"></tbody>
   </table>
+  <div class="empty" style="padding-top:8px" id="signalsNote"></div>
 </section>
 
 <section>
@@ -215,10 +219,17 @@ async function refresh() {
       const triggerFrac = (2 + zEntry) / span;
       bar = '<span class="zbar"><b style="left:' + (triggerFrac * 100) + '%"></b><i style="left:' + (frac * 100) + '%"></i></span>';
     }
-    return '<tr><td>' + row.symbol + '</td><td class="num">' + px(row.price) +
-      '</td><td class="num">' + (row.z == null ? '—' : fmt(row.z)) + '</td><td>' + bar + '</td><td>' +
+    const volCell = row.volPct == null ? '—'
+      : row.volOk ? fmt(row.volPct) + '%'
+      : '<span style="color:var(--muted)">' + fmt(row.volPct) + '% — too calm</span>';
+    return '<tr' + (row.volOk === false ? ' style="opacity:0.55"' : '') + '><td>' + row.symbol + '</td><td class="num">' + px(row.price) +
+      '</td><td class="num">' + (row.z == null ? '—' : fmt(row.z)) + '</td><td>' + bar + '</td><td class="num">' + volCell + '</td><td>' +
       (row.holding ? '<span class="hold">holding</span>' : '') + '</td></tr>';
   }).join('');
+  const minVol = s.symbols.find(r => r.minVolPct != null);
+  document.getElementById('signalsNote').textContent = minVol
+    ? 'A buy needs BOTH: z-score past the trigger AND volatility ≥ ' + fmt(minVol.minVolPct) + '% (so the expected snap-back clears the ' + fmt(Number(s.params.feePctPerSide) * 2) + '% round-trip fee). Dimmed rows are too calm to trade profitably.'
+    : '';
 
   document.getElementById('positions').innerHTML = s.positions.length === 0
     ? '<div class="empty">None — waiting for a signal.</div>'
