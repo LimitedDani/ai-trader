@@ -22,8 +22,5 @@
   },
   "pnpm": {
     "minimumReleaseAge": 4320
-  },
-  "dependencies": {
-    "@anthropic-ai/sdk": "^0.116.0"
   }
 }
