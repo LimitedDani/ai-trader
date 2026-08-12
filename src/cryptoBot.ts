@@ -49,10 +49,9 @@ if (llmTrader && isLive && process.env.LLM_LIVE_OK !== '1') {
   );
 }
 
-// LLM_FULL_CONTROL=1: no automatic stop-loss — the LLM alone decides every
-// exit. PAPER ONLY: with real money the tick-level stop-loss always stays,
-// because a 5-minute decision cadence cannot catch a flash crash.
-const llmFullControl = llmTrader && process.env.LLM_FULL_CONTROL === '1' && !isLive;
+// LLM_FULL_CONTROL=1 sets the INITIAL default for the stop-loss toggle (off).
+// The live toggle (control.stopLossEnabled) is the runtime source of truth and
+// can be flipped from the dashboard; it persists across restarts.
 // Live quote currency: EUR (Bitvavo category A, 0.25% taker) or USDC
 // (category B, 0.05% taker — 5x cheaper; convert EUR->USDC on Bitvavo first).
 const quote = (process.env.FAST_QUOTE ?? 'EUR').toUpperCase();
@@ -98,15 +97,43 @@ const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`)
 // Buying toggle: pauses the bot's automatic entries; exits (stop/revert/
 // timeout) and manual dashboard actions keep working. Persisted per mode.
 const CONTROL_FILE = process.env.CONTROL_FILE ?? join(process.env.STATE_DIR ?? '.', `control-${mode}.json`);
-let buyingEnabled = existsSync(CONTROL_FILE)
-  ? (JSON.parse(readFileSync(CONTROL_FILE, 'utf8')) as { buyingEnabled: boolean }).buyingEnabled
-  : true;
+interface Control {
+  buyingEnabled: boolean;
+  stopLossEnabled: boolean;
+}
+const control: Control = (() => {
+  // Default stop-loss OFF only in the paper full-control experiment; ON everywhere else.
+  const defaults: Control = {
+    buyingEnabled: true,
+    stopLossEnabled: !(llmTrader && process.env.LLM_FULL_CONTROL === '1' && !isLive),
+  };
+  try {
+    if (existsSync(CONTROL_FILE)) return { ...defaults, ...JSON.parse(readFileSync(CONTROL_FILE, 'utf8')) };
+  } catch {
+    /* fall through to defaults */
+  }
+  return defaults;
+})();
+
+function saveControl(): void {
+  mkdirSync(dirname(CONTROL_FILE), { recursive: true });
+  writeFileSync(CONTROL_FILE, JSON.stringify(control));
+}
 
 function setBuying(enabled: boolean): void {
-  buyingEnabled = enabled;
-  mkdirSync(dirname(CONTROL_FILE), { recursive: true });
-  writeFileSync(CONTROL_FILE, JSON.stringify({ buyingEnabled }));
+  control.buyingEnabled = enabled;
+  saveControl();
   log(`Buying ${enabled ? 'ENABLED' : 'PAUSED'} — exits and manual trades stay active`);
+}
+
+function setStopLoss(enabled: boolean): void {
+  control.stopLossEnabled = enabled;
+  saveControl();
+  log(
+    enabled
+      ? `Automatic stop-loss ENABLED (${params.stopLossPct}% per position)`
+      : `Automatic stop-loss DISABLED — ${isLive ? '*** the LLM alone protects real money ***' : 'the LLM alone decides every exit'}`,
+  );
 }
 
 function makeBroker(): PaperBroker | LiveBroker {
@@ -260,14 +287,12 @@ function onTick(symbol: string, price: number): void {
 
       if (open) {
         const barsHeld = barIndexNow() - open.enteredAtBar;
-        // LLM-trader mode: the LLM owns sells; only the stop-loss fires
-        // automatically — unless full control is on (paper), then nothing does.
+        // LLM-trader mode: the LLM owns sells; the automatic stop-loss fires
+        // only while the dashboard toggle (control.stopLossEnabled) is on.
         const reason = llmTrader
-          ? llmFullControl
-            ? null
-            : price <= open.entry * (1 - params.stopLossPct / 100)
-              ? ('stop' as const)
-              : null
+          ? control.stopLossEnabled && price <= open.entry * (1 - params.stopLossPct / 100)
+            ? ('stop' as const)
+            : null
           : shouldExitAtPrice(price, stats, open.entry, barsHeld, params);
         if (reason) {
           const fill = await broker.sell(symbol, price, reason);
@@ -280,7 +305,7 @@ function onTick(symbol: string, price: number): void {
       }
 
       if (llmTrader) return; // entries are the LLM's job (llmTradeCycle), not the tick loop's
-      if (!buyingEnabled) return; // user paused new entries; exits above still ran
+      if (!control.buyingEnabled) return; // user paused new entries; exits above still ran
       if (activePositionCount() >= maxOpen) return; // overtime positions don't hold a slot
       if (broker.balanceUsdt < positionQuote) return;
       if (realizedToday() <= -maxDailyLoss) return; // kill switch: no new entries today
@@ -358,7 +383,10 @@ function buildDashboardState(): DashboardState {
       ? `LLM TRADER — ${isLive ? 'LIVE, real money (Bitvavo)' : 'paper'}${lastLlmComment ? ` · "${lastLlmComment}"` : ''}`
       : isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
     currency,
-    buyingEnabled,
+    buyingEnabled: control.buyingEnabled,
+    stopLossEnabled: control.stopLossEnabled,
+    stopLossToggleable: llmTrader,
+    isLive,
     gates: {
       regimeBearish,
       breadthBlocked: breadthBlocked(),
@@ -480,7 +508,7 @@ function pushLlmLog(entry: LlmLogEntry): void {
 /** LLM-trader mode: give the model the full picture, let it decide, execute. */
 async function llmTradeCycle(): Promise<void> {
   if (!llmConfigured) return; // no brain connected yet — do nothing, loudly at startup only
-  if (!buyingEnabled) return;
+  if (!control.buyingEnabled) return;
   if (realizedToday() <= -maxDailyLoss) {
     log(`LLM trader: daily kill switch engaged (-${maxDailyLoss} ${currency} realized) — no decisions until tomorrow`);
     return;
@@ -533,9 +561,9 @@ async function llmTradeCycle(): Promise<void> {
     `Open positions:\n${posLines.length ? posLines.join('\n') : '(none)'}\n\n` +
     `Buy candidates (pre-filtered: real dips with enough volatility to out-earn the fee; all other markets are untradeable this cycle):\n${marketLines.length ? marketLines.join('\n') : '(none this cycle — selling/holding are your only options)'}\n\n` +
     `Recent headlines:\n${currentHeadlines().slice(0, 8).map((h) => `- ${h}`).join('\n') || '(none)'}\n\n` +
-    (llmFullControl
-      ? `There is NO automatic stop-loss: you alone are responsible for cutting losses and taking profits. Unmanaged losing positions will keep losing.\n`
-      : `A hard stop-loss at -${params.stopLossPct}% per position fires automatically; everything else is your call.\n`) +
+    (control.stopLossEnabled
+      ? `A hard stop-loss at -${params.stopLossPct}% per position fires automatically; everything else is your call.\n`
+      : `There is NO automatic stop-loss: you alone are responsible for cutting losses and taking profits. Unmanaged losing positions will keep losing.\n`) +
     `Decide your actions for the next 5 minutes. You may buy, sell, or do nothing. ` +
     `Think briefly — a few sentences of reasoning is enough; do not exhaustively analyze every market. ` +
     `Respond with ONLY a JSON object, no other text:\n` +
@@ -672,11 +700,13 @@ async function main(): Promise<void> {
       `Mode: LLM TRADER (${isLive ? '*** LIVE — REAL MONEY ***' : 'paper'}) — ` +
         (llmConfigured
           ? `decisions by ${llmBackend} every ${intervalMin} minutes` +
-            (llmFullControl ? ' — FULL CONTROL: no automatic stop-loss, the LLM owns every exit' : '')
+            (control.stopLossEnabled
+              ? ` (auto stop-loss ${params.stopLossPct}% on)`
+              : ' — FULL CONTROL: no automatic stop-loss, the LLM owns every exit')
           : 'NO BRAIN CONNECTED: set DEEPSEEK_API_KEY (or OLLAMA_URL) to start trading'),
     );
-    if (llmTrader && process.env.LLM_FULL_CONTROL === '1' && isLive) {
-      log('NOTE: LLM_FULL_CONTROL is ignored in live mode — the stop-loss stays with real money.');
+    if (isLive && !control.stopLossEnabled) {
+      log('WARNING: automatic stop-loss is OFF while trading REAL MONEY — the LLM is the only thing cutting losses.');
     }
   } else if (!isLive) {
     log('Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
@@ -687,13 +717,14 @@ async function main(): Promise<void> {
   log(`Params: z>${params.zEntry}, SL ${params.stopLossPct}%, max hold ${params.maxHoldBars} bars, fee ${params.feePctPerSide}%/side`);
   log(`Reaction: tick-level (websocket). Entry trigger z < -${params.zEntry}.`);
 
-  if (!buyingEnabled) log('Note: buying is PAUSED (persisted from last session) — toggle it on the dashboard');
+  if (!control.buyingEnabled) log('Note: buying is PAUSED (persisted from last session) — toggle it on the dashboard');
   // PORT is what cloud hosts (Railway etc.) inject; DASH_PORT is the local override.
   startDashboard(
     Number(process.env.PORT ?? process.env.DASH_PORT ?? 8787),
     buildDashboardState,
     handleManualTrade,
     setBuying,
+    setStopLoss,
     log,
   );
 

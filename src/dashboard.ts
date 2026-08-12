@@ -28,6 +28,9 @@ export interface DashboardState {
   mode: string;
   currency: string;
   buyingEnabled: boolean;
+  stopLossEnabled: boolean;
+  stopLossToggleable: boolean;
+  isLive: boolean;
   gates: {
     regimeBearish: boolean;
     breadthBlocked: boolean;
@@ -87,6 +90,7 @@ export function startDashboard(
   getState: () => DashboardState,
   onTrade: (t: TradeAction) => TradeResult | Promise<TradeResult>,
   onSetBuying: (enabled: boolean) => void,
+  onSetStopLoss: (enabled: boolean) => void,
   log: (msg: string) => void,
 ): void {
   // Security model: without DASH_PASSWORD the server binds to localhost only.
@@ -138,6 +142,23 @@ export function startDashboard(
           onSetBuying(enabled);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: true, message: enabled ? 'Buying enabled' : 'Buying paused — open positions still exit normally' }));
+        } catch (err) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, message: (err as Error).message }));
+        }
+      });
+      return;
+    }
+    if (req.url === '/api/stoploss' && req.method === 'POST') {
+      let body = '';
+      req.on('data', (chunk) => (body += chunk));
+      req.on('end', () => {
+        try {
+          const { enabled } = JSON.parse(body) as { enabled: boolean };
+          if (typeof enabled !== 'boolean') throw new Error('enabled must be boolean');
+          onSetStopLoss(enabled);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, message: enabled ? 'Automatic stop-loss ON' : 'Automatic stop-loss OFF — the LLM alone cuts losses' }));
         } catch (err) {
           res.writeHead(400, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ ok: false, message: (err as Error).message }));
@@ -247,6 +268,7 @@ const PAGE = /* html */ `<!doctype html>
   <span class="badge" id="mode">…</span>
   <span class="badge" id="params">…</span>
   <button class="trade" id="buyToggle" style="display:none"></button>
+  <button class="trade" id="slToggle" style="display:none"></button>
   <span id="gates"></span>
   <span class="pulse" id="pulse">connecting…</span>
 </header>
@@ -346,6 +368,18 @@ async function refresh() {
   tgl.textContent = s.buyingEnabled ? '⏸ Pause buying' : '▶ Resume buying';
   tgl.style.color = s.buyingEnabled ? '' : 'var(--bad)';
   tgl.style.borderColor = s.buyingEnabled ? '' : 'var(--bad)';
+
+  const sl = document.getElementById('slToggle');
+  if (s.stopLossToggleable) {
+    sl.style.display = '';
+    sl.dataset.enabled = s.stopLossEnabled ? '1' : '';
+    sl.dataset.live = s.isLive ? '1' : '';
+    sl.textContent = s.stopLossEnabled ? '🛡 Stop-loss ON' : '⚠ Stop-loss OFF';
+    sl.style.color = s.stopLossEnabled ? '' : 'var(--bad)';
+    sl.style.borderColor = s.stopLossEnabled ? '' : 'var(--bad)';
+  } else {
+    sl.style.display = 'none';
+  }
 
   const g = s.gates || {};
   const badges = [];
@@ -522,6 +556,27 @@ document.getElementById('buyToggle').addEventListener('click', async (e) => {
   btn.disabled = true;
   try {
     const res = await fetch('/api/buying', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: enable }),
+    });
+    toast((await res.json()).message);
+  } catch { toast('request failed — is the bot running?'); }
+  btn.disabled = false;
+  refresh();
+});
+
+document.getElementById('slToggle').addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  const enable = !btn.dataset.enabled;
+  // Turning the disaster brake off on real money gets an extra, explicit gate.
+  if (!enable && btn.dataset.live) {
+    if (!confirm('Disable the automatic stop-loss on REAL MONEY?\n\nThe LLM decides only every 5 minutes; nothing will catch a fast crash in between. Type OK only if you accept that.')) return;
+  } else if (!confirm((enable ? 'Enable' : 'Disable') + ' the automatic stop-loss?')) {
+    return;
+  }
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/stoploss', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ enabled: enable }),
     });
