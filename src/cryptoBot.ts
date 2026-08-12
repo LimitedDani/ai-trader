@@ -656,7 +656,10 @@ async function main(): Promise<void> {
   }
 
   const topMatch = /^TOP(\d+)$/.exec(symbolsEnv);
-  if (topMatch) {
+  if (symbolsEnv === 'ALL') {
+    symbols = await data.topSymbols(100000); // every market, still volume-sorted
+    log(`Tracking ALL ${symbols.length} ${useBitvavoData ? quote : 'USDT'} markets — spread/volatility filters keep the tradeable set small`);
+  } else if (topMatch) {
     const n = Math.min(Number(topMatch[1]), 50);
     symbols = await data.topSymbols(n);
     log(`Auto-selected top ${symbols.length} ${useBitvavoData ? quote : 'USDT'} pairs by 24h volume`);
