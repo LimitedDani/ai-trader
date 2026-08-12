@@ -65,14 +65,28 @@ export async function askLlm(prompt: string, timeoutMs = TIMEOUT_MS): Promise<st
       },
       body: JSON.stringify({
         model: DEEPSEEK_MODEL,
-        max_tokens: 500,
+        // Hybrid reasoning models spend tokens thinking before answering —
+        // leave generous headroom or the visible answer arrives empty.
+        max_tokens: 4000,
         messages: [{ role: 'user', content: prompt }],
       }),
       signal: AbortSignal.timeout(timeoutMs),
     });
     if (!res.ok) throw new Error(`deepseek ${res.status}: ${(await res.text()).slice(0, 120)}`);
-    const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
-    return body.choices?.[0]?.message?.content ?? '';
+    const body = (await res.json()) as {
+      error?: { message?: string };
+      choices?: { finish_reason?: string; message?: { content?: string; reasoning_content?: string } }[];
+    };
+    if (body.error) throw new Error(`deepseek: ${body.error.message ?? 'unknown error'}`);
+    const choice = body.choices?.[0];
+    const content = choice?.message?.content?.trim() ?? '';
+    if (!content) {
+      throw new Error(
+        `deepseek empty answer (finish_reason=${choice?.finish_reason ?? '?'}, ` +
+          `reasoning=${choice?.message?.reasoning_content ? 'present but unfinished' : 'none'})`,
+      );
+    }
+    return content;
   }
   const res = await ollamaFetch('/api/generate', {
     method: 'POST',
