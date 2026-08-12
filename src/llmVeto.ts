@@ -66,8 +66,9 @@ export async function askLlm(prompt: string, timeoutMs = TIMEOUT_MS): Promise<st
       body: JSON.stringify({
         model: DEEPSEEK_MODEL,
         // Hybrid reasoning models spend tokens thinking before answering —
-        // leave generous headroom or the visible answer arrives empty.
-        max_tokens: 4000,
+        // leave generous headroom or the visible answer arrives empty
+        // (finish_reason=length with unfinished reasoning).
+        max_tokens: Number(process.env.DEEPSEEK_MAX_TOKENS ?? 8000),
         messages: [{ role: 'user', content: prompt }],
       }),
       signal: AbortSignal.timeout(timeoutMs),

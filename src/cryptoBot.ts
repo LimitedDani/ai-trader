@@ -482,6 +482,7 @@ async function llmTradeCycle(): Promise<void> {
       ? `There is NO automatic stop-loss: you alone are responsible for cutting losses and taking profits. Unmanaged losing positions will keep losing.\n`
       : `A hard stop-loss at -${params.stopLossPct}% per position fires automatically; everything else is your call.\n`) +
     `Decide your actions for the next 5 minutes. You may buy, sell, or do nothing. ` +
+    `Think briefly — a few sentences of reasoning is enough; do not exhaustively analyze every market. ` +
     `Respond with ONLY a JSON object, no other text:\n` +
     `{"actions":[{"type":"buy","symbol":"XXX-${quote}","reason":"..."} or {"type":"sell","symbol":"...","reason":"..."}],"comment":"one line on your thinking"}`;
 

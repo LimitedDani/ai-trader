@@ -402,7 +402,9 @@ async function refresh() {
           ? p.holdMinutes + 'm — <span style="color:var(--muted)">waiting for ≥ ' + px(p.breakevenPrice) + '</span>'
           : p.holdMinutes + 'm / ' + p.timeoutMinutes + 'm') + '</td>' +
         '<td><button class="trade" onclick="trade(\\'sell\\', \\'' + p.symbol + '\\', this)">Sell</button></td></tr>').join('') + '</tbody></table>' +
-      '<div class="empty" style="padding-top:8px">Sells when: z rises to ≥ 0 (price back at its mean) · price hits the stop · after the hold timer: only at the first net-profitable price (breakeven hunt) — the stop-loss stays the one losing exit.</div>';
+      '<div class="empty" style="padding-top:8px">' + (s.mode.startsWith('LLM')
+        ? 'Exits are decided by the LLM each cycle' + (s.mode.includes('paper') ? ' — full control: no automatic stop-loss or timer.' : ' — plus the hard stop-loss as disaster brake.')
+        : 'Sells when: z rises to ≥ 0 (price back at its mean) · price hits the stop · after the hold timer: only at the first net-profitable price (breakeven hunt) — the stop-loss stays the one losing exit.') + '</div>';
 
   const sells = s.fills.filter(f => f.side === 'Sell').slice(-50).reverse();
   document.getElementById('fills').innerHTML = sells.length === 0
