@@ -43,25 +43,34 @@ export async function fetchTopMarkets(n: number, quote = 'EUR'): Promise<string[
  * much denser). Trades give the traded price; between trades, the bid/ask
  * midpoint keeps the price current so stops react to quote moves too.
  */
+export interface PriceStream {
+  /** Add markets to the live subscription without reconnecting. */
+  subscribe: (markets: string[]) => void;
+}
+
 export function streamTrades(
   markets: string[],
   onPrice: (market: string, price: number) => void,
   onStatus: (msg: string) => void = () => {},
   onQuote: (market: string, bid: number, ask: number) => void = () => {},
-): void {
+): PriceStream {
+  const subscribed = new Set(markets);
+  let live: WebSocket | null = null;
   function connect(): void {
     const ws = new WebSocket(WS_URL);
     ws.addEventListener('open', () => {
+      live = ws;
+      const all = [...subscribed];
       ws.send(
         JSON.stringify({
           action: 'subscribe',
           channels: [
-            { name: 'trades', markets },
-            { name: 'ticker', markets },
+            { name: 'trades', markets: all },
+            { name: 'ticker', markets: all },
           ],
         }),
       );
-      onStatus(`Bitvavo websocket connected, subscribed to ${markets.length} markets (trades + ticker)`);
+      onStatus(`Bitvavo websocket connected, subscribed to ${all.length} markets (trades + ticker)`);
     });
     ws.addEventListener('message', (event) => {
       try {
@@ -95,6 +104,7 @@ export function streamTrades(
       }
     });
     const reconnect = () => {
+      if (live === ws) live = null;
       onStatus('Bitvavo websocket disconnected, reconnecting in 2s');
       setTimeout(connect, 2_000);
     };
@@ -102,6 +112,26 @@ export function streamTrades(
     ws.addEventListener('error', () => ws.close());
   }
   connect();
+
+  return {
+    subscribe(newMarkets: string[]): void {
+      const added = newMarkets.filter((m) => !subscribed.has(m));
+      if (added.length === 0) return;
+      for (const m of added) subscribed.add(m);
+      if (live && live.readyState === 1) {
+        live.send(
+          JSON.stringify({
+            action: 'subscribe',
+            channels: [
+              { name: 'trades', markets: added },
+              { name: 'ticker', markets: added },
+            ],
+          }),
+        );
+      }
+      // If not open now, the next reconnect subscribes the full set anyway.
+    },
+  };
 }
 
 interface OrderResponse {

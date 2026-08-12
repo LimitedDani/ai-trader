@@ -748,7 +748,7 @@ async function main(): Promise<void> {
 
   await refreshStats();
   await refreshRegime();
-  data.stream(symbols, onTick, log, (symbol: string, bid: number, ask: number) =>
+  const stream = data.stream(symbols, onTick, log, (symbol: string, bid: number, ask: number) =>
     quotes.set(symbol, { bid, ask }),
   );
 
@@ -760,6 +760,29 @@ async function main(): Promise<void> {
   }, intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
   setTimeout(heartbeat, 5_000);
+
+  // Universe sync: for TOP<n>/ALL modes, periodically re-fetch the market list
+  // so newly listed coins are picked up without a restart. Every 6h — new
+  // listings are rare, and this keeps API load and price-stream churn low.
+  const autoUniverse = symbolsEnv === 'ALL' || /^TOP\d+$/.test(symbolsEnv);
+  if (autoUniverse) {
+    const n = symbolsEnv === 'ALL' ? 100000 : Math.min(Number(/^TOP(\d+)$/.exec(symbolsEnv)![1]), 50);
+    setInterval(() => {
+      void (async () => {
+        try {
+          const latest = await data.topSymbols(n);
+          const added = latest.filter((s) => !symbols.includes(s));
+          if (added.length === 0) return;
+          symbols.push(...added);
+          stream.subscribe(added); // start receiving their prices now
+          await refreshStats(); // compute their z-scores for the next cycle
+          log(`Universe sync: added ${added.length} new market(s) — ${added.join(', ')}`);
+        } catch (err) {
+          log(`WARN: universe sync failed: ${(err as Error).message}`);
+        }
+      })();
+    }, 6 * 60 * 60 * 1000);
+  }
 }
 
 main().catch((err) => {

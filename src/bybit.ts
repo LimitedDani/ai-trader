@@ -87,13 +87,19 @@ export async function fetchTopSymbols(n: number): Promise<string[]> {
  * Requires Node's WebSocket global (run with --experimental-websocket on Node 20).
  * Reconnects automatically; sends the protocol ping every 20s.
  */
+export interface PriceStream {
+  subscribe: (symbols: string[]) => void;
+}
+
 export function streamPrices(
   symbols: string[],
   onPrice: (symbol: string, price: number) => void,
   onStatus: (msg: string) => void = () => {},
   _onQuote?: (symbol: string, bid: number, ask: number) => void, // parity with bitvavo.streamTrades; tickers channel has no book quotes here
-): void {
+): PriceStream {
   const WS_URL = 'wss://stream.bybit.com/v5/public/spot';
+  const subscribed = new Set(symbols);
+  let live: WebSocket | null = null;
 
   function connect(): void {
     const ws = new WebSocket(WS_URL);
@@ -101,12 +107,13 @@ export function streamPrices(
 
     ws.addEventListener('open', () => {
       // Bybit caps subscribe requests at 10 topics each — batch them.
-      const topics = symbols.map((s) => `tickers.${s}`);
+      live = ws;
+      const topics = [...subscribed].map((s) => `tickers.${s}`);
       for (let i = 0; i < topics.length; i += 10) {
         ws.send(JSON.stringify({ op: 'subscribe', args: topics.slice(i, i + 10) }));
       }
       ping = setInterval(() => ws.send(JSON.stringify({ op: 'ping' })), 20_000);
-      onStatus(`websocket connected, subscribed to ${symbols.length} tickers`);
+      onStatus(`websocket connected, subscribed to ${subscribed.size} tickers`);
     });
 
     ws.addEventListener('message', (event) => {
@@ -127,6 +134,7 @@ export function streamPrices(
 
     const reconnect = () => {
       if (ping) clearInterval(ping);
+      if (live === ws) live = null;
       onStatus('websocket disconnected, reconnecting in 2s');
       setTimeout(connect, 2_000);
     };
@@ -135,5 +143,19 @@ export function streamPrices(
   }
 
   connect();
+
+  return {
+    subscribe(newSymbols: string[]): void {
+      const added = newSymbols.filter((s) => !subscribed.has(s));
+      if (added.length === 0) return;
+      for (const s of added) subscribed.add(s);
+      if (live && live.readyState === 1) {
+        const topics = added.map((s) => `tickers.${s}`);
+        for (let i = 0; i < topics.length; i += 10) {
+          live.send(JSON.stringify({ op: 'subscribe', args: topics.slice(i, i + 10) }));
+        }
+      }
+    },
+  };
 }
 
