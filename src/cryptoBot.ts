@@ -48,6 +48,11 @@ if (llmTrader && isLive && process.env.LLM_LIVE_OK !== '1') {
       'that an unproven AI strategy will trade real money within the configured risk limits.',
   );
 }
+
+// LLM_FULL_CONTROL=1: no automatic stop-loss — the LLM alone decides every
+// exit. PAPER ONLY: with real money the tick-level stop-loss always stays,
+// because a 5-minute decision cadence cannot catch a flash crash.
+const llmFullControl = llmTrader && process.env.LLM_FULL_CONTROL === '1' && !isLive;
 // Live quote currency: EUR (Bitvavo category A, 0.25% taker) or USDC
 // (category B, 0.05% taker — 5x cheaper; convert EUR->USDC on Bitvavo first).
 const quote = (process.env.FAST_QUOTE ?? 'EUR').toUpperCase();
@@ -255,11 +260,14 @@ function onTick(symbol: string, price: number): void {
 
       if (open) {
         const barsHeld = barIndexNow() - open.enteredAtBar;
-        // LLM-trader mode: the LLM owns sells; only the stop-loss fires automatically.
+        // LLM-trader mode: the LLM owns sells; only the stop-loss fires
+        // automatically — unless full control is on (paper), then nothing does.
         const reason = llmTrader
-          ? price <= open.entry * (1 - params.stopLossPct / 100)
-            ? ('stop' as const)
-            : null
+          ? llmFullControl
+            ? null
+            : price <= open.entry * (1 - params.stopLossPct / 100)
+              ? ('stop' as const)
+              : null
           : shouldExitAtPrice(price, stats, open.entry, barsHeld, params);
         if (reason) {
           const fill = await broker.sell(symbol, price, reason);
@@ -470,6 +478,9 @@ async function llmTradeCycle(): Promise<void> {
     `Open positions:\n${posLines.length ? posLines.join('\n') : '(none)'}\n\n` +
     `Market snapshot (z = std devs from 4h mean; negative = dip):\n${marketLines.join('\n')}\n\n` +
     `Recent headlines:\n${currentHeadlines().slice(0, 15).map((h) => `- ${h}`).join('\n') || '(none)'}\n\n` +
+    (llmFullControl
+      ? `There is NO automatic stop-loss: you alone are responsible for cutting losses and taking profits. Unmanaged losing positions will keep losing.\n`
+      : `A hard stop-loss at -${params.stopLossPct}% per position fires automatically; everything else is your call.\n`) +
     `Decide your actions for the next 5 minutes. You may buy, sell, or do nothing. ` +
     `Respond with ONLY a JSON object, no other text:\n` +
     `{"actions":[{"type":"buy","symbol":"XXX-${quote}","reason":"..."} or {"type":"sell","symbol":"...","reason":"..."}],"comment":"one line on your thinking"}`;
@@ -576,9 +587,13 @@ async function main(): Promise<void> {
     log(
       `Mode: LLM TRADER (${isLive ? '*** LIVE — REAL MONEY ***' : 'paper'}) — ` +
         (llmConfigured
-          ? `decisions by ${llmBackend} every ${intervalMin} minutes`
+          ? `decisions by ${llmBackend} every ${intervalMin} minutes` +
+            (llmFullControl ? ' — FULL CONTROL: no automatic stop-loss, the LLM owns every exit' : '')
           : 'NO BRAIN CONNECTED: set DEEPSEEK_API_KEY (or OLLAMA_URL) to start trading'),
     );
+    if (llmTrader && process.env.LLM_FULL_CONTROL === '1' && isLive) {
+      log('NOTE: LLM_FULL_CONTROL is ignored in live mode — the stop-loss stays with real money.');
+    }
   } else if (!isLive) {
     log('Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
   }
