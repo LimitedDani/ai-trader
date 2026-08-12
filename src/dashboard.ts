@@ -437,10 +437,14 @@ function drawChart(series) {
 
   let g = '';
   const gridN = 4;
+  // Axis decimals adapt to the visible range — a €1 span needs cents,
+  // otherwise adjacent labels round to the same number.
+  const span = vMax - vMin;
+  const axDec = span < 2 ? 2 : span < 20 ? 1 : 0;
   for (let i = 0; i <= gridN; i++) {
     const v = vMin + (vMax - vMin) * i / gridN;
     g += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + y(v) + '" y2="' + y(v) + '" stroke="var(--grid)" stroke-width="1"/>' +
-         '<text x="' + (padL - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">' + Math.round(v).toLocaleString() + '</text>';
+         '<text x="' + (padL - 8) + '" y="' + (y(v) + 4) + '" text-anchor="end" fill="var(--muted)" font-size="11">' + fmt(v, axDec) + '</text>';
   }
   const path = series.map((p, i) => (i ? 'L' : 'M') + x(new Date(p.t).getTime()).toFixed(1) + ' ' + y(p.v).toFixed(1)).join(' ');
   g += '<path d="' + path + '" fill="none" stroke="var(--series-1)" stroke-width="2" stroke-linejoin="round"/>';
