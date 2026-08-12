@@ -518,7 +518,9 @@ async function llmTradeCycle(): Promise<void> {
 
   let answer: string;
   try {
-    answer = await askLlm(prompt, 60_000);
+    // Reasoning models can legitimately take minutes; the cycle is 5 min,
+    // so allow up to 3 before declaring the brain unreachable.
+    answer = await askLlm(prompt, Number(process.env.LLM_DECIDE_TIMEOUT_MS ?? 180_000));
   } catch (err) {
     log(`LLM trader: brain unreachable (${(err as Error).message}) — holding`);
     logEntry.error = `brain unreachable: ${(err as Error).message}`;
