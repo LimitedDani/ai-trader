@@ -113,13 +113,46 @@ interface OrderResponse {
   feeCurrency: string;
 }
 
+interface MarketSpec {
+  quantityDecimals: number; // max decimals allowed in the order amount
+  tickSize: number; // price must be an integer multiple of this
+}
+
 export class BitvavoClient {
+  private specs = new Map<string, MarketSpec>();
+
   constructor(
     private readonly apiKey: string,
     private readonly apiSecret: string,
     /** Quote currency of the traded markets — fees paid in it are booked. */
     private readonly quote = 'EUR',
   ) {}
+
+  /** Load per-market precision rules (amount decimals + price tick). Public, no auth. */
+  async loadSpecs(): Promise<void> {
+    const rows = await publicGet<{ market: string; quantityDecimals: number; tickSize: string }[]>('/markets');
+    for (const r of rows) {
+      this.specs.set(r.market, {
+        quantityDecimals: r.quantityDecimals,
+        tickSize: Number(r.tickSize),
+      });
+    }
+  }
+
+  /** Round a base amount DOWN to the market's allowed decimals. */
+  private roundAmount(market: string, qty: number): string {
+    const dec = this.specs.get(market)?.quantityDecimals ?? 6;
+    const factor = 10 ** dec;
+    return (Math.floor(qty * factor) / factor).toFixed(dec);
+  }
+
+  /** Round a price DOWN to the market's tick size (safe as a buy bid). */
+  private roundPrice(market: string, price: number): string {
+    const tick = this.specs.get(market)?.tickSize;
+    if (!tick) return String(Number(price.toPrecision(5)));
+    const decimals = Math.max(0, Math.round(-Math.log10(tick)));
+    return (Math.floor(price / tick) * tick).toFixed(decimals);
+  }
 
   private async signed<T>(method: 'GET' | 'POST' | 'DELETE', path: string, body?: Record<string, unknown>): Promise<T> {
     const timestamp = String(Date.now());
@@ -173,14 +206,15 @@ export class BitvavoClient {
     limitPrice: number,
     waitMs: number,
   ): Promise<{ qtyBase: number; costQuote: number; price: number; feeQuote: number }> {
-    const price = Number(limitPrice.toPrecision(5)); // Bitvavo: 5 significant digits
-    const amount = String(Math.floor((quoteAmount / price) * 1e8) / 1e8);
+    const priceStr = this.roundPrice(market, limitPrice); // aligned to the market's tick size
+    const price = Number(priceStr);
+    const amount = this.roundAmount(market, quoteAmount / price); // aligned to quantityDecimals
     const placed = await this.signed<OrderResponse & { orderId: string }>('POST', '/order', {
       market,
       side: 'buy',
       orderType: 'limit',
       amount,
-      price: String(price),
+      price: priceStr,
       postOnly: true,
       operatorId: this.operatorId,
     });
@@ -225,15 +259,15 @@ export class BitvavoClient {
     return { qtyBase, costQuote: spent + feeQuote, price: spent / qtyBase, feeQuote };
   }
 
-  /** Market sell of `qtyBase` (floored to 8 decimals). Returns EUR proceeds after fee. */
+  /** Market sell of `qtyBase` (rounded down to the market's quantityDecimals). */
   async marketSell(market: string, qtyBase: number): Promise<{ proceedsQuote: number; price: number; qtySold: number; feeQuote: number }> {
-    const qty = Math.floor(qtyBase * 1e8) / 1e8;
-    if (!(qty > 0)) throw new Error(`${market} sell: qty rounds to zero`);
+    const amount = this.roundAmount(market, qtyBase);
+    if (!(Number(amount) > 0)) throw new Error(`${market} sell: qty rounds to zero`);
     const order = await this.signed<OrderResponse>('POST', '/order', {
       market,
       side: 'sell',
       orderType: 'market',
-      amount: String(qty),
+      amount,
       disableMarketProtection: false,
       operatorId: this.operatorId,
     });

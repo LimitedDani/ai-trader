@@ -76,7 +76,14 @@ const maxSpreadPct = Number(process.env.FAST_MAX_SPREAD_PCT ?? 0.15); // skip en
 const entryGapMin = Number(process.env.FAST_ENTRY_GAP_MIN ?? 10); // min minutes between automatic entries
 const breadthFrac = Number(process.env.FAST_BREADTH_FRAC ?? 0.3); // >=30% triggered at once = market event
 const regimePct = Number(process.env.FAST_REGIME_PCT ?? 0.5); // BTC this far below its 24h mean = bearish
-const entryStyle = (process.env.FAST_ENTRY_STYLE ?? 'maker') === 'taker' ? 'taker' : 'maker';
+// The LLM trader uses market (taker) entries: they spend a fixed EUR amount,
+// so they always fill and never trip Bitvavo's amount-decimal / price-tick
+// rules. The statistical bot defaults to maker limit orders for the cheaper fee.
+const entryStyle: 'maker' | 'taker' = llmTrader
+  ? 'taker'
+  : (process.env.FAST_ENTRY_STYLE ?? 'maker') === 'taker'
+    ? 'taker'
+    : 'maker';
 const intervalMin = 5;
 const heartbeatSeconds = 60;
 
@@ -662,6 +669,7 @@ async function main(): Promise<void> {
     log(`Safety rails: ${positionQuote} EUR/trade, max ${maxOpen} open, kill switch at -${maxDailyLoss} EUR/day`);
     log('Starting in 30 seconds — Ctrl+C now to abort.');
     await new Promise((resolve) => setTimeout(resolve, 30_000));
+    await (broker as LiveBroker).loadSpecs(); // per-market amount decimals + price tick
     await (broker as LiveBroker).refreshBalance();
     setInterval(() => void (broker as LiveBroker).refreshBalance().catch((e: Error) => log(`WARN balance: ${e.message}`)), 60_000);
 

@@ -40,6 +40,11 @@ export class LiveBroker {
     writeFileSync(STATE_FILE, JSON.stringify(this.state, null, 2));
   }
 
+  /** Load per-market precision rules once (amount decimals + price tick). */
+  async loadSpecs(): Promise<void> {
+    await this.client.loadSpecs();
+  }
+
   /** Call at startup and periodically; keeps the sync getters accurate. */
   async refreshBalance(): Promise<void> {
     this.cachedBalance = await this.client.balance(this.quote);
