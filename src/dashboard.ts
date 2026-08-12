@@ -570,7 +570,7 @@ document.getElementById('slToggle').addEventListener('click', async (e) => {
   const enable = !btn.dataset.enabled;
   // Turning the disaster brake off on real money gets an extra, explicit gate.
   if (!enable && btn.dataset.live) {
-    if (!confirm('Disable the automatic stop-loss on REAL MONEY?\n\nThe LLM decides only every 5 minutes; nothing will catch a fast crash in between. Type OK only if you accept that.')) return;
+    if (!confirm('Disable the automatic stop-loss on REAL MONEY? The LLM decides only every 5 minutes; nothing will catch a fast crash in between. OK only if you accept that.')) return;
   } else if (!confirm((enable ? 'Enable' : 'Disable') + ' the automatic stop-loss?')) {
     return;
   }
