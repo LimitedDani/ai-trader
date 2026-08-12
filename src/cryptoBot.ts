@@ -486,26 +486,53 @@ async function llmTradeCycle(): Promise<void> {
     return;
   }
 
-  const marketLines = symbols
-    .map((s) => ({ s, z: currentZ(s), p: lastPrice.get(s), stats: statsBySymbol.get(s) }))
-    .filter((r) => r.p !== undefined && r.z !== null)
-    .sort((a, b) => Math.abs(b.z!) - Math.abs(a.z!))
-    .slice(0, 15)
-    .map((r) => `${r.s}: price ${r.p}, z=${r.z!.toFixed(2)}, vol ${r.stats ? ((r.stats.std / r.p!) * 100).toFixed(2) : '?'}%, spread ${spreadPct(r.s)?.toFixed(3) ?? '?'}%`);
+  // Statistical pre-filter does the screening for free; the LLM only judges
+  // what is actually actionable. Fewer inputs = far less reasoning spend.
+  const minVolPct = params.minVolMultiple * ((params.feePctPerSide * 2) / 100) * 100;
+  const canBuy = broker.openPositions.length < maxOpen && broker.balanceUsdt >= positionQuote;
+  const candidates = !canBuy
+    ? []
+    : symbols
+        .map((s) => ({ s, z: currentZ(s), p: lastPrice.get(s), stats: statsBySymbol.get(s) }))
+        .filter(
+          (r) =>
+            r.p !== undefined &&
+            r.z !== null &&
+            r.z <= -1.0 && // a real dip
+            r.stats !== undefined &&
+            (r.stats.std / r.p) * 100 >= minVolPct && // volatile enough to out-earn the fee
+            !broker.position(r.s),
+        )
+        .sort((a, b) => a.z! - b.z!)
+        .slice(0, 8);
+  const marketLines = candidates.map(
+    (r) => `${r.s}: price ${r.p}, z=${r.z!.toFixed(2)}, vol ${((r.stats!.std / r.p!) * 100).toFixed(2)}%, spread ${spreadPct(r.s)?.toFixed(3) ?? '?'}%`,
+  );
 
   const posLines = broker.openPositions.map((p) => {
     const now = lastPrice.get(p.symbol) ?? p.entry;
     const pnlPct = ((now - p.entry) / p.entry) * 100 - params.feePctPerSide * 2;
-    return `${p.symbol}: qty ${p.qtyBase.toFixed(6)}, entry ${p.entry}, now ${now}, net P&L ${pnlPct.toFixed(2)}%, held ${(barIndexNow() - p.enteredAtBar) * intervalMin}min`;
+    const z = currentZ(p.symbol);
+    return `${p.symbol}: entry ${p.entry}, now ${now}, net P&L ${pnlPct.toFixed(2)}%, z now ${z === null ? '?' : z.toFixed(2)}, held ${(barIndexNow() - p.enteredAtBar) * intervalMin}min`;
   });
+
+  // Nothing to decide? Skip the brain call entirely — it costs nothing to hold.
+  if (posLines.length === 0 && candidates.length === 0) {
+    pushLlmLog({
+      t: new Date().toISOString(),
+      comment: 'skipped — nothing to decide (no positions, no qualifying dips), no tokens spent',
+      actions: [],
+    });
+    return;
+  }
 
   const prompt =
     `You are an autonomous crypto trader managing a ${isLive ? 'REAL-MONEY' : 'PAPER'} portfolio (quote currency ${currency}).\n` +
     `Cash: ${broker.balanceUsdt.toFixed(2)} ${currency}. Max ${maxOpen} open positions, ${positionQuote} ${currency} per buy. ` +
     `Round-trip trading fee ${(params.feePctPerSide * 2).toFixed(2)}% — a trade must beat that to profit.\n\n` +
     `Open positions:\n${posLines.length ? posLines.join('\n') : '(none)'}\n\n` +
-    `Market snapshot (z = std devs from 4h mean; negative = dip):\n${marketLines.join('\n')}\n\n` +
-    `Recent headlines:\n${currentHeadlines().slice(0, 15).map((h) => `- ${h}`).join('\n') || '(none)'}\n\n` +
+    `Buy candidates (pre-filtered: real dips with enough volatility to out-earn the fee; all other markets are untradeable this cycle):\n${marketLines.length ? marketLines.join('\n') : '(none this cycle — selling/holding are your only options)'}\n\n` +
+    `Recent headlines:\n${currentHeadlines().slice(0, 8).map((h) => `- ${h}`).join('\n') || '(none)'}\n\n` +
     (llmFullControl
       ? `There is NO automatic stop-loss: you alone are responsible for cutting losses and taking profits. Unmanaged losing positions will keep losing.\n`
       : `A hard stop-loss at -${params.stopLossPct}% per position fires automatically; everything else is your call.\n`) +
