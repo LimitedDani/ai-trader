@@ -20,6 +20,10 @@ const OLLAMA_AUTH = process.env.OLLAMA_AUTH;
 function ollamaFetch(path: string, init: RequestInit = {}): Promise<Response> {
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
+    // ngrok free tier serves an HTML warning page to unrecognized clients;
+    // this header opts out so the actual Ollama response passes through.
+    'ngrok-skip-browser-warning': 'true',
+    'User-Agent': 'ai-trader-bot',
     ...(init.headers as Record<string, string> | undefined),
   };
   if (OLLAMA_AUTH) headers.Authorization = `Basic ${Buffer.from(OLLAMA_AUTH).toString('base64')}`;
