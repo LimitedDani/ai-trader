@@ -71,6 +71,12 @@ export interface DashboardState {
   fills: unknown[];
   equitySeries: { t: string; v: number }[];
   totalTicks: number;
+  llmLog: {
+    t: string;
+    comment?: string;
+    error?: string;
+    actions: { type: string; symbol: string; reason: string; result: string }[];
+  }[];
 }
 
 export type TradeAction = { action: 'buy' | 'sell'; symbol: string };
@@ -269,6 +275,11 @@ const PAGE = /* html */ `<!doctype html>
   </div>
 </section>
 
+<section id="llmlogSection" style="display:none">
+  <h2>🧠 LLM decision log — what it thinks and why</h2>
+  <div id="llmlog"></div>
+</section>
+
 <section>
   <h2>Trade history</h2>
   <div id="fills"></div>
@@ -414,6 +425,32 @@ async function refresh() {
         '<tr><td>' + new Date(f.time).toLocaleString() + '</td><td>' + f.symbol + '</td><td class="num">' + fmt(f.price) +
         '</td><td>' + (f.reason || '') + '</td><td class="num">' + pnlCell(f.pnlUsdt, ' ' + cur) + '</td></tr>').join('') +
       '</tbody></table>';
+
+  const llmSection = document.getElementById('llmlogSection');
+  if (s.llmLog && s.llmLog.length > 0) {
+    llmSection.style.display = '';
+    const esc = (t) => String(t ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    document.getElementById('llmlog').innerHTML = s.llmLog.map((e) => {
+      const time = new Date(e.t).toLocaleTimeString();
+      let html = '<div style="padding:8px 0;border-bottom:1px solid var(--grid)">';
+      html += '<span style="color:var(--muted);font-size:12px">' + time + '</span> ';
+      if (e.error) {
+        html += '<span class="down">⚠ ' + esc(e.error) + '</span>';
+      } else {
+        html += '<em>“' + esc(e.comment) + '”</em>';
+        if (e.actions.length === 0) html += ' <span style="color:var(--muted)">— held everything</span>';
+        for (const a of e.actions) {
+          const cls = a.type === 'buy' ? 'up' : 'down';
+          html += '<div style="margin:4px 0 0 16px;font-size:13px"><span class="' + cls + '">' +
+            a.type.toUpperCase() + ' ' + esc(a.symbol) + '</span> — ' + esc(a.reason) +
+            ' <span style="color:var(--muted)">→ ' + esc(a.result) + '</span></div>';
+        }
+      }
+      return html + '</div>';
+    }).join('');
+  } else if (llmSection) {
+    llmSection.style.display = 'none';
+  }
 
   drawChart(s.equitySeries);
 }

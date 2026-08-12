@@ -419,6 +419,7 @@ function buildDashboardState(): DashboardState {
     fills: broker.allFills.slice(-200),
     equitySeries,
     totalTicks,
+    llmLog: llmTrader ? llmLog.slice(-40).reverse() : [],
   };
 }
 
@@ -448,6 +449,33 @@ async function handleManualTrade({ action, symbol }: TradeAction): Promise<Trade
 }
 
 let lastLlmComment = '';
+
+// Persistent journal of every LLM decision cycle — shown on the dashboard.
+export interface LlmLogEntry {
+  t: string;
+  comment?: string;
+  error?: string;
+  actions: { type: string; symbol: string; reason: string; result: string }[];
+}
+const LLM_LOG_FILE = join(process.env.STATE_DIR ?? '.', 'llm-log.json');
+let llmLog: LlmLogEntry[] = (() => {
+  try {
+    return existsSync(LLM_LOG_FILE) ? (JSON.parse(readFileSync(LLM_LOG_FILE, 'utf8')) as LlmLogEntry[]) : [];
+  } catch {
+    return [];
+  }
+})();
+
+function pushLlmLog(entry: LlmLogEntry): void {
+  llmLog.push(entry);
+  if (llmLog.length > 300) llmLog = llmLog.slice(-300);
+  try {
+    mkdirSync(dirname(LLM_LOG_FILE), { recursive: true });
+    writeFileSync(LLM_LOG_FILE, JSON.stringify(llmLog));
+  } catch (err) {
+    log(`WARN: llm-log write failed: ${(err as Error).message}`);
+  }
+}
 
 /** LLM-trader mode: give the model the full picture, let it decide, execute. */
 async function llmTradeCycle(): Promise<void> {
@@ -486,11 +514,15 @@ async function llmTradeCycle(): Promise<void> {
     `Respond with ONLY a JSON object, no other text:\n` +
     `{"actions":[{"type":"buy","symbol":"XXX-${quote}","reason":"..."} or {"type":"sell","symbol":"...","reason":"..."}],"comment":"one line on your thinking"}`;
 
+  const logEntry: LlmLogEntry = { t: new Date().toISOString(), actions: [] };
+
   let answer: string;
   try {
     answer = await askLlm(prompt, 60_000);
   } catch (err) {
     log(`LLM trader: brain unreachable (${(err as Error).message}) — holding`);
+    logEntry.error = `brain unreachable: ${(err as Error).message}`;
+    pushLlmLog(logEntry);
     return;
   }
 
@@ -502,34 +534,56 @@ async function llmTradeCycle(): Promise<void> {
     decision = JSON.parse(jsonMatch ? jsonMatch[0] : cleaned);
   } catch {
     log(`LLM trader: unparseable answer, holding — "${answer.slice(0, 160)}"`);
+    logEntry.error = `unparseable answer: "${answer.slice(0, 160)}"`;
+    pushLlmLog(logEntry);
     return;
   }
 
   lastLlmComment = (decision.comment ?? '').slice(0, 200);
+  logEntry.comment = lastLlmComment || '(no comment)';
   if (lastLlmComment) log(`LLM trader thinks: ${lastLlmComment}`);
 
   for (const action of (decision.actions ?? []).slice(0, 5)) {
     const symbol = (action.symbol ?? '').toUpperCase();
-    const reason = `llm: ${(action.reason ?? 'no reason given').slice(0, 120)}`;
+    const shortReason = (action.reason ?? 'no reason given').slice(0, 160);
+    const reason = `llm: ${shortReason.slice(0, 120)}`;
+    const record = (result: string) =>
+      logEntry.actions.push({ type: action.type ?? '?', symbol, reason: shortReason, result });
     try {
       if (action.type === 'sell') {
         const pos = broker.position(symbol);
         const price = lastPrice.get(symbol);
-        if (!pos || price === undefined) continue;
+        if (!pos || price === undefined) {
+          record('skipped — no such position');
+          continue;
+        }
         const fill = await broker.sell(symbol, price, reason);
         log(`LLM SELL ${symbol} @ ${fill.price} | P&L ${fill.pnlUsdt!.toFixed(2)} ${currency} | ${reason}`);
+        record(`sold @ ${fill.price} — P&L ${fill.pnlUsdt!.toFixed(2)} ${currency}`);
       } else if (action.type === 'buy') {
-        if (!symbols.includes(symbol) || broker.position(symbol)) continue;
-        if (broker.openPositions.length >= maxOpen || broker.balanceUsdt < positionQuote) continue;
+        if (!symbols.includes(symbol) || broker.position(symbol)) {
+          record('skipped — unknown symbol or already holding');
+          continue;
+        }
+        if (broker.openPositions.length >= maxOpen || broker.balanceUsdt < positionQuote) {
+          record('skipped — position/cash limit');
+          continue;
+        }
         const price = lastPrice.get(symbol);
-        if (price === undefined) continue;
+        if (price === undefined) {
+          record('skipped — no live price');
+          continue;
+        }
         const pos = await broker.buy(symbol, positionQuote, price, barIndexNow(), reason);
         log(`LLM BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} | ${reason}`);
+        record(`bought ${pos.qtyBase.toFixed(6)} @ ${pos.entry}`);
       }
     } catch (err) {
       log(`LLM trader: ${action.type} ${symbol} failed: ${(err as Error).message}`);
+      record(`failed: ${(err as Error).message}`);
     }
   }
+  pushLlmLog(logEntry);
 }
 
 async function main(): Promise<void> {
