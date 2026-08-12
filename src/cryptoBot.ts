@@ -17,7 +17,7 @@ import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
 import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
-import { askOllama, currentHeadlines, llmConfigured, llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
+import { askLlm, currentHeadlines, llmBackend, llmConfigured, llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
 import { LiveBroker } from './liveBroker.js';
 import { PaperBroker } from './paperBroker.js';
 import {
@@ -39,8 +39,14 @@ const isLive = mode === 'live';
 // must earn its way to real money on the same terms every strategy did.
 // The tick-level stop-loss remains active underneath as a disaster brake.
 const llmTrader = process.env.LLM_TRADER === '1';
-if (llmTrader && isLive) {
-  throw new Error('LLM_TRADER runs in paper mode only. Let it beat the statistical bot on paper first, then promote it deliberately.');
+// LLM + real money requires a deliberate, explicit opt-in. The LLM is a
+// non-deterministic, unbacktestable strategy: expect losses, size small,
+// and know that the stop-loss + daily kill switch are the only hard floors.
+if (llmTrader && isLive && process.env.LLM_LIVE_OK !== '1') {
+  throw new Error(
+    'LLM_TRADER with TRADE_MODE=live needs LLM_LIVE_OK=1 — an explicit acknowledgment ' +
+      'that an unproven AI strategy will trade real money within the configured risk limits.',
+  );
 }
 // Live quote currency: EUR (Bitvavo category A, 0.25% taker) or USDC
 // (category B, 0.05% taker — 5x cheaper; convert EUR->USDC on Bitvavo first).
@@ -341,7 +347,7 @@ function buildDashboardState(): DashboardState {
 
   return {
     mode: llmTrader
-      ? `LLM TRADER — paper (experimental)${lastLlmComment ? ` · "${lastLlmComment}"` : ''}`
+      ? `LLM TRADER — ${isLive ? 'LIVE, real money (Bitvavo)' : 'paper'}${lastLlmComment ? ` · "${lastLlmComment}"` : ''}`
       : isLive ? 'LIVE — real money (Bitvavo)' : 'paper trading (live prices)',
     currency,
     buyingEnabled,
@@ -439,6 +445,10 @@ let lastLlmComment = '';
 async function llmTradeCycle(): Promise<void> {
   if (!llmConfigured) return; // no brain connected yet — do nothing, loudly at startup only
   if (!buyingEnabled) return;
+  if (realizedToday() <= -maxDailyLoss) {
+    log(`LLM trader: daily kill switch engaged (-${maxDailyLoss} ${currency} realized) — no decisions until tomorrow`);
+    return;
+  }
 
   const marketLines = symbols
     .map((s) => ({ s, z: currentZ(s), p: lastPrice.get(s), stats: statsBySymbol.get(s) }))
@@ -454,7 +464,7 @@ async function llmTradeCycle(): Promise<void> {
   });
 
   const prompt =
-    `You are an autonomous crypto trader managing a PAPER portfolio (quote currency ${currency}).\n` +
+    `You are an autonomous crypto trader managing a ${isLive ? 'REAL-MONEY' : 'PAPER'} portfolio (quote currency ${currency}).\n` +
     `Cash: ${broker.balanceUsdt.toFixed(2)} ${currency}. Max ${maxOpen} open positions, ${positionQuote} ${currency} per buy. ` +
     `Round-trip trading fee ${(params.feePctPerSide * 2).toFixed(2)}% — a trade must beat that to profit.\n\n` +
     `Open positions:\n${posLines.length ? posLines.join('\n') : '(none)'}\n\n` +
@@ -466,7 +476,7 @@ async function llmTradeCycle(): Promise<void> {
 
   let answer: string;
   try {
-    answer = await askOllama(prompt, 60_000);
+    answer = await askLlm(prompt, 60_000);
   } catch (err) {
     log(`LLM trader: brain unreachable (${(err as Error).message}) — holding`);
     return;
@@ -562,10 +572,15 @@ async function main(): Promise<void> {
     }
   }
 
-  if (!isLive) {
-    log(llmTrader
-      ? `Mode: LLM TRADER (paper, experimental) — decisions by ${llmConfigured ? 'the connected LLM every ${intervalMin} minutes' : 'NOTHING yet: set OLLAMA_URL to connect a brain'}`
-      : 'Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
+  if (llmTrader) {
+    log(
+      `Mode: LLM TRADER (${isLive ? '*** LIVE — REAL MONEY ***' : 'paper'}) — ` +
+        (llmConfigured
+          ? `decisions by ${llmBackend} every ${intervalMin} minutes`
+          : 'NO BRAIN CONNECTED: set DEEPSEEK_API_KEY (or OLLAMA_URL) to start trading'),
+    );
+  } else if (!isLive) {
+    log('Mode: LOCAL PAPER TRADING (streaming prices, simulated fills, no real money)');
   }
 
   log(broker.summary());

@@ -10,6 +10,11 @@
  *    silently stop the strategy.
  *  - Never in the tick loop's hot path: verdicts are cached per coin.
  */
+// DeepSeek cloud API (OpenAI-compatible, pay-per-call) — preferred when set.
+const DEEPSEEK_API_KEY = process.env.DEEPSEEK_API_KEY;
+const DEEPSEEK_MODEL = process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash';
+const DEEPSEEK_URL = process.env.DEEPSEEK_URL ?? 'https://api.deepseek.com/chat/completions';
+
 const OLLAMA_URL = process.env.OLLAMA_URL;
 const MODEL = process.env.OLLAMA_MODEL ?? 'llama3.2:3b';
 const TIMEOUT_MS = Number(process.env.OLLAMA_TIMEOUT_MS ?? 20_000);
@@ -36,16 +41,39 @@ const FEEDS = [
 const VERDICT_TTL_MS = 10 * 60 * 1000;
 const NEWS_REFRESH_MS = 5 * 60 * 1000;
 
-export const llmVetoEnabled = Boolean(OLLAMA_URL);
-export const llmConfigured = Boolean(OLLAMA_URL);
+export const llmConfigured = Boolean(DEEPSEEK_API_KEY || OLLAMA_URL);
+export const llmVetoEnabled = llmConfigured;
+export const llmBackend = DEEPSEEK_API_KEY
+  ? `DeepSeek API (${DEEPSEEK_MODEL})`
+  : OLLAMA_URL
+    ? `Ollama (${MODEL})`
+    : 'off';
 
 /** Current cached headlines (refreshed every few minutes when the LLM is on). */
 export function currentHeadlines(): string[] {
   return headlines;
 }
 
-/** Generic ask against the configured Ollama backend. Throws on failure. */
-export async function askOllama(prompt: string, timeoutMs = TIMEOUT_MS): Promise<string> {
+/** Generic ask against the configured LLM backend. Throws on failure. */
+export async function askLlm(prompt: string, timeoutMs = TIMEOUT_MS): Promise<string> {
+  if (DEEPSEEK_API_KEY) {
+    const res = await fetch(DEEPSEEK_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${DEEPSEEK_API_KEY}`,
+      },
+      body: JSON.stringify({
+        model: DEEPSEEK_MODEL,
+        max_tokens: 500,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (!res.ok) throw new Error(`deepseek ${res.status}: ${(await res.text()).slice(0, 120)}`);
+    const body = (await res.json()) as { choices?: { message?: { content?: string } }[] };
+    return body.choices?.[0]?.message?.content ?? '';
+  }
   const res = await ollamaFetch('/api/generate', {
     method: 'POST',
     body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
@@ -106,10 +134,10 @@ async function ensureModel(log: (msg: string) => void): Promise<void> {
 
 export function startNewsRefresh(log: (msg: string) => void): void {
   if (!llmVetoEnabled) return;
-  void ensureModel(log);
+  if (!DEEPSEEK_API_KEY) void ensureModel(log); // Ollama needs provisioning; cloud APIs don't
   void refreshNews(log);
   setInterval(() => void refreshNews(log), NEWS_REFRESH_MS);
-  log(`LLM news veto ENABLED (${OLLAMA_URL}, model ${MODEL}) — veto-only, fail-open`);
+  log(`LLM ENABLED via ${llmBackend} — veto is fail-open; trader mode decides every cycle`);
 }
 
 /** Ask the local LLM whether breaking negative news should block buying `coin`. */
@@ -126,14 +154,8 @@ export async function newsVeto(coin: string, log: (msg: string) => void): Promis
       `Question: do any of these headlines report BREAKING NEGATIVE news specifically about ` +
       `${coin} (hack, exploit, lawsuit, delisting, insolvency, depeg)? ` +
       `General market moves do not count. Answer with exactly YES or NO, then one short sentence.`;
-    const res = await ollamaFetch('/api/generate', {
-      method: 'POST',
-      body: JSON.stringify({ model: MODEL, prompt, stream: false, keep_alive: '24h' }),
-      signal: AbortSignal.timeout(TIMEOUT_MS),
-    });
-    if (!res.ok) throw new Error(`ollama ${res.status}`);
-    const answer = ((await res.json()) as { response?: string }).response ?? '';
-    const veto = /^\s*YES/i.test(answer);
+    const answer = await askLlm(prompt);
+    const veto = /^\s*YES/i.test(answer.trim());
     verdicts.set(coin, { veto, at: Date.now(), note: answer.slice(0, 120) });
     const ms = Date.now() - t0;
     log(`LLM veto: ${coin} → ${veto ? 'BLOCK' : 'clear'} in ${(ms / 1000).toFixed(1)}s${veto ? ` — ${answer.slice(0, 120)}` : ''}`);
