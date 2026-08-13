@@ -16,6 +16,7 @@ import { dirname, join } from 'node:path';
 import * as bybit from './bybit.js';
 import * as bitvavo from './bitvavo.js';
 import { BitvavoClient } from './bitvavo.js';
+import { dataFileMB, mlLoggingEnabled, recordRows, type MlRow } from './dataLogger.js';
 import { startDashboard, type DashboardState, type TradeAction, type TradeResult } from './dashboard.js';
 import { askLlm, currentHeadlines, llmBackend, llmConfigured, llmVetoEnabled, newsVeto, startNewsRefresh } from './llmVeto.js';
 import { LiveBroker } from './liveBroker.js';
@@ -272,6 +273,31 @@ async function refreshStats(): Promise<void> {
       }),
     );
   }
+}
+
+/** Snapshot current features for every symbol — the ML training dataset. */
+function recordMlSnapshot(): void {
+  if (!mlLoggingEnabled) return;
+  const t = new Date().toISOString();
+  const trig = triggeredCount();
+  const rows: MlRow[] = [];
+  for (const symbol of symbols) {
+    const p = lastPrice.get(symbol);
+    if (p === undefined) continue;
+    const stats = statsBySymbol.get(symbol);
+    rows.push({
+      t,
+      s: symbol,
+      p,
+      z: currentZ(symbol),
+      vol: stats ? (stats.std / p) * 100 : null,
+      spr: spreadPct(symbol),
+      bear: regimeBearish,
+      trig,
+      hold: broker.position(symbol) !== undefined,
+    });
+  }
+  recordRows(rows, log);
 }
 
 function onTick(symbol: string, price: number): void {
@@ -821,6 +847,7 @@ async function main(): Promise<void> {
       `regime BTC -${regimePct}%, LLM veto ${llmVetoEnabled ? 'ON' : 'off'}`,
   );
   startNewsRefresh(log);
+  if (mlLoggingEnabled) log(`ML data recorder ON — features to ml-data.jsonl (${dataFileMB().toFixed(1)} MB so far), download at /api/ml-data`);
 
   await refreshStats();
   await refreshRegime();
@@ -830,6 +857,7 @@ async function main(): Promise<void> {
 
   setInterval(() => {
     void refreshStats().then(() => {
+      recordMlSnapshot(); // capture the feature dataset each cycle
       if (llmTrader) void runLlm(llmTradeCycle);
     });
     void refreshRegime();
