@@ -513,6 +513,82 @@ function pushLlmLog(entry: LlmLogEntry): void {
 }
 
 /** LLM-trader mode: give the model the full picture, let it decide, execute. */
+// One LLM call at a time: the 5-min full cycle and the 1-min exit check must
+// never run concurrently (they'd both trade on the same positions).
+let llmBusy = false;
+async function runLlm(fn: () => Promise<void>): Promise<void> {
+  if (!llmConfigured || llmBusy) return;
+  llmBusy = true;
+  try {
+    await fn();
+  } catch (err) {
+    log(`LLM cycle error: ${(err as Error).message}`);
+  } finally {
+    llmBusy = false;
+  }
+}
+
+/** Fast exit check (every minute): only open positions, sell-or-hold, small prompt. */
+async function llmExitCycle(): Promise<void> {
+  if (!control.buyingEnabled || broker.openPositions.length === 0) return;
+
+  const posLines = broker.openPositions.map((p) => {
+    const now = lastPrice.get(p.symbol) ?? p.entry;
+    const pnlPct = ((now - p.entry) / p.entry) * 100 - params.feePctPerSide * 2;
+    const z = currentZ(p.symbol);
+    return `${p.symbol}: entry ${p.entry}, now ${now}, net P&L ${pnlPct.toFixed(2)}%, z now ${z === null ? '?' : z.toFixed(2)}, held ${(barIndexNow() - p.enteredAtBar) * intervalMin}min`;
+  });
+
+  const prompt =
+    `You manage these ${isLive ? 'REAL-MONEY' : 'PAPER'} open crypto positions (quote ${currency}). ` +
+    `Round-trip fee ${(params.feePctPerSide * 2).toFixed(2)}% — selling only pays off if it locks a net gain or cuts a deteriorating loser.\n` +
+    `Positions:\n${posLines.join('\n')}\n\n` +
+    `For each position decide SELL or HOLD. Default to HOLD; sell only when it clearly improves the outcome. ` +
+    `Think briefly. Respond with ONLY JSON: {"actions":[{"type":"sell","symbol":"XXX-${quote}","reason":"..."}],"comment":"one line"}`;
+
+  const logEntry: LlmLogEntry = { t: new Date().toISOString(), comment: '', actions: [] };
+  let answer: string;
+  try {
+    answer = await askLlm(prompt, Number(process.env.LLM_DECIDE_TIMEOUT_MS ?? 180_000));
+  } catch (err) {
+    logEntry.error = `exit-check brain unreachable: ${(err as Error).message}`;
+    pushLlmLog(logEntry);
+    return;
+  }
+
+  let decision: { actions?: { type?: string; symbol?: string; reason?: string }[]; comment?: string };
+  try {
+    const cleaned = answer.replace(/<think>[\s\S]*?<\/think>/g, '').trim();
+    const m = cleaned.match(/\{[\s\S]*\}/);
+    decision = JSON.parse(m ? m[0] : cleaned);
+  } catch {
+    logEntry.error = `exit-check unparseable: "${answer.slice(0, 160)}"`;
+    pushLlmLog(logEntry);
+    return;
+  }
+
+  logEntry.comment = 'exit-check: ' + ((decision.comment ?? '').slice(0, 180) || 'hold all');
+  for (const action of (decision.actions ?? []).slice(0, maxOpen)) {
+    if (action.type !== 'sell') continue; // exit check can only sell
+    const symbol = (action.symbol ?? '').toUpperCase();
+    const shortReason = (action.reason ?? 'no reason given').slice(0, 160);
+    try {
+      const pos = broker.position(symbol);
+      const price = lastPrice.get(symbol);
+      if (!pos || price === undefined) {
+        logEntry.actions.push({ type: 'sell', symbol, reason: shortReason, result: 'skipped — no such position' });
+        continue;
+      }
+      const fill = await broker.sell(symbol, price, `llm-exit: ${shortReason.slice(0, 110)}`);
+      log(`LLM EXIT-SELL ${symbol} @ ${fill.price} | P&L ${fill.pnlUsdt!.toFixed(2)} ${currency} | ${shortReason}`);
+      logEntry.actions.push({ type: 'sell', symbol, reason: shortReason, result: `sold @ ${fill.price} — P&L ${fill.pnlUsdt!.toFixed(2)} ${currency}` });
+    } catch (err) {
+      logEntry.actions.push({ type: 'sell', symbol, reason: shortReason, result: `failed: ${(err as Error).message}` });
+    }
+  }
+  pushLlmLog(logEntry);
+}
+
 async function llmTradeCycle(): Promise<void> {
   if (!llmConfigured) return; // no brain connected yet — do nothing, loudly at startup only
   if (!control.buyingEnabled) return;
@@ -754,12 +830,20 @@ async function main(): Promise<void> {
 
   setInterval(() => {
     void refreshStats().then(() => {
-      if (llmTrader) void llmTradeCycle();
+      if (llmTrader) void runLlm(llmTradeCycle);
     });
     void refreshRegime();
   }, intervalMin * 60 * 1000);
   setInterval(heartbeat, heartbeatSeconds * 1000);
   setTimeout(heartbeat, 5_000);
+
+  // Fast exit management: check open positions with the LLM every minute
+  // (0 disables). Skipped automatically while the 5-min full cycle is running.
+  const exitCheckMin = Number(process.env.LLM_EXIT_CHECK_MIN ?? 1);
+  if (llmTrader && exitCheckMin > 0) {
+    log(`LLM exit-check: open positions reviewed every ${exitCheckMin} min (full buy+sell cycle stays ${intervalMin} min)`);
+    setInterval(() => void runLlm(llmExitCycle), exitCheckMin * 60 * 1000);
+  }
 
   // Universe sync: for TOP<n>/ALL modes, periodically re-fetch the market list
   // so newly listed coins are picked up without a restart. Every 6h — new
