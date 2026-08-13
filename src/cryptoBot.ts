@@ -24,10 +24,14 @@ import { PaperBroker } from './paperBroker.js';
 import {
   breakevenPrice,
   DEFAULT_FAST_PARAMS,
+  DEFAULT_MOMENTUM_PARAMS,
+  momentumEntry,
+  momentumExit,
   rollingStats,
   shouldEnterAtPrice,
   shouldExitAtPrice,
   type FastParams,
+  type MomentumParams,
   type Stats,
 } from './fastStrategy.js';
 
@@ -80,11 +84,12 @@ const regimePct = Number(process.env.FAST_REGIME_PCT ?? 0.5); // BTC this far be
 // The LLM trader uses market (taker) entries: they spend a fixed EUR amount,
 // so they always fill and never trip Bitvavo's amount-decimal / price-tick
 // rules. The statistical bot defaults to maker limit orders for the cheaper fee.
-const entryStyle: 'maker' | 'taker' = llmTrader
-  ? 'taker'
-  : (process.env.FAST_ENTRY_STYLE ?? 'maker') === 'taker'
+const entryStyle: 'maker' | 'taker' =
+  llmTrader || (process.env.STRATEGY ?? '').toLowerCase() === 'momentum'
     ? 'taker'
-    : 'maker';
+    : (process.env.FAST_ENTRY_STYLE ?? 'maker') === 'taker'
+      ? 'taker'
+      : 'maker';
 const intervalMin = 5;
 const heartbeatSeconds = 60;
 
@@ -99,6 +104,20 @@ const params: FastParams = {
   // price (only the stop-loss forces a losing exit); 'sell' dumps at market.
   timeoutAction: (process.env.FAST_TIMEOUT_ACTION ?? 'breakeven') === 'sell' ? 'sell' : 'breakeven',
 };
+
+// STRATEGY=momentum: buy risers, ride with a trailing stop, sell on pullback.
+// Only sensible on low-fee USDC markets. Momentum uses market (taker) entries
+// so it actually catches the upward move.
+const strategy = (process.env.STRATEGY ?? 'reversion').toLowerCase() === 'momentum' ? 'momentum' : 'reversion';
+const momentum: MomentumParams = {
+  ...DEFAULT_MOMENTUM_PARAMS,
+  breakoutPct: Number(process.env.MOM_BREAKOUT_PCT ?? 0.6),
+  trailPct: Number(process.env.MOM_TRAIL_PCT ?? 0.5),
+  hardStopPct: Number(process.env.MOM_STOP_PCT ?? 1.0),
+  feePctPerSide: params.feePctPerSide,
+};
+const peakSinceEntry = new Map<string, number>(); // trailing-stop high-water mark per position
+const closesBySymbol = new Map<string, number[]>(); // recent closes for momentum entry
 
 const log = (msg: string) => console.log(`[${new Date().toISOString()}] ${msg}`);
 
@@ -267,6 +286,7 @@ async function refreshStats(): Promise<void> {
           const closes = await data.recentCloses(symbol);
           const stats = rollingStats(closes, params.lookback);
           if (stats) statsBySymbol.set(symbol, stats);
+          if (strategy === 'momentum') closesBySymbol.set(symbol, closes.slice(-momentum.lookback - 1));
         } catch (err) {
           log(`WARN: stats refresh failed for ${symbol}: ${(err as Error).message}`);
         }
@@ -319,6 +339,18 @@ function onTick(symbol: string, price: number): void {
       const open = broker.position(symbol);
 
       if (open) {
+        // --- MOMENTUM: trailing stop from the peak since entry ---
+        if (strategy === 'momentum') {
+          const peak = Math.max(peakSinceEntry.get(symbol) ?? open.entry, price);
+          peakSinceEntry.set(symbol, peak);
+          const reason = momentumExit(price, open.entry, peak, momentum);
+          if (reason) {
+            const fill = await broker.sell(symbol, price, reason);
+            peakSinceEntry.delete(symbol);
+            log(`SELL ${symbol} @ ${fill.price} | ${reason} | P&L ${fill.pnlUsdt!.toFixed(2)} ${currency} | ${broker.summary()}`);
+          }
+          return;
+        }
         const barsHeld = barIndexNow() - open.enteredAtBar;
         // LLM-trader mode: the LLM owns sells; the automatic stop-loss fires
         // only while the dashboard toggle (control.stopLossEnabled) is on.
@@ -343,13 +375,30 @@ function onTick(symbol: string, price: number): void {
       if (broker.balanceUsdt < positionQuote) return;
       if (realizedToday() <= -maxDailyLoss) return; // kill switch: no new entries today
 
+      const spread = spreadPct(symbol);
+
+      // --- MOMENTUM: buy risers, protect only against wide spreads ---
+      if (strategy === 'momentum') {
+        if (Date.now() - lastEntryAt < entryGapMin * 60 * 1000) return; // spacing
+        if (spread !== null && spread > maxSpreadPct) return; // fee protection
+        const closes = closesBySymbol.get(symbol);
+        if (!closes || !momentumEntry(closes, price, momentum)) return;
+        lastEntryAt = Date.now();
+        const pos = await broker.buy(symbol, positionQuote, price, barIndexNow());
+        peakSinceEntry.set(symbol, pos.entry);
+        log(
+          `BUY ${symbol} ${pos.qtyBase.toFixed(6)} @ ${pos.entry} (${positionQuote} ${currency}), ` +
+            `trail ${momentum.trailPct}% / stop ${momentum.hardStopPct}% | ${broker.summary()}`,
+        );
+        return;
+      }
+
       if (!shouldEnterAtPrice(price, stats, params)) return;
 
       // Gate chain — each protects against a different way of losing:
       if (regimeBearish) return; // 3. falling market: reversion stands down
       if (Date.now() - lastEntryAt < entryGapMin * 60 * 1000) return; // 2. entry spacing
       if (breadthBlocked()) return; // 2. half the board triggering = one market event, not N signals
-      const spread = spreadPct(symbol);
       if (spread !== null && spread > maxSpreadPct) return; // 1. wide book = invisible fee
       const coin = symbol.replace(/[-]?(EUR|USDC|USDT)$/, '');
       if (await newsVeto(coin, log)) return; // 5. LLM: breaking bad news on this coin

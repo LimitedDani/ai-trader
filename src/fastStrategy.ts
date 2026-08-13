@@ -41,6 +41,51 @@ export function breakevenPrice(entryPrice: number, p: FastParams): number {
   return entryPrice * (1 + (2 * p.feePctPerSide) / 100);
 }
 
+/**
+ * Momentum strategy: buy coins that are rising, ride them with a trailing
+ * stop, sell when they pull back. Only viable on low-fee (USDC) markets.
+ */
+export interface MomentumParams {
+  lookback: number; // bars used to measure short-term momentum
+  breakoutPct: number; // require this % rise over the lookback to enter
+  trailPct: number; // sell when price falls this % from its peak since entry
+  hardStopPct: number; // absolute floor from entry
+  feePctPerSide: number;
+  minVolMultiple: number; // require std/price > multiple * round-trip fee
+}
+
+export const DEFAULT_MOMENTUM_PARAMS: MomentumParams = {
+  lookback: 6, // ~30 min on 5-min bars
+  breakoutPct: 0.6,
+  trailPct: 0.5,
+  hardStopPct: 1.0,
+  feePctPerSide: 0.05, // Bitvavo USDC taker
+  minVolMultiple: 2,
+};
+
+/** Enter when price is rising: up breakoutPct over the lookback, volatile enough to clear fees. */
+export function momentumEntry(closes: number[], price: number, p: MomentumParams): boolean {
+  if (closes.length < p.lookback + 1) return false;
+  const past = closes[closes.length - 1 - p.lookback]!;
+  if (!(past > 0)) return false;
+  const risePct = ((price - past) / past) * 100;
+  if (risePct < p.breakoutPct) return false; // not rising enough
+  // volatility floor so the trailing exit can clear the round-trip fee
+  const stats = rollingStats(closes, Math.min(p.lookback * 4, closes.length - 1));
+  if (stats && stats.std / price < p.minVolMultiple * ((p.feePctPerSide * 2) / 100)) return false;
+  return true;
+}
+
+/**
+ * Exit: trailing stop from the peak seen since entry (rides winners, sells on
+ * a pullback), with a hard stop as the absolute floor.
+ */
+export function momentumExit(price: number, entry: number, peak: number, p: MomentumParams): 'trail' | 'stop' | null {
+  if (price <= entry * (1 - p.hardStopPct / 100)) return 'stop';
+  if (price <= peak * (1 - p.trailPct / 100)) return 'trail';
+  return null;
+}
+
 export interface Stats {
   mean: number;
   std: number;
